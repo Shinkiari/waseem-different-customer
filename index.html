@@ -854,9 +854,100 @@ tfoot td {
   body { background:#fff!important; }
   @page { size:A4 portrait; margin:8mm 10mm; }
 }
+
+/* ════════ LOGIN OVERLAY ════════ */
+#aaf-lock-overlay {
+  position: fixed; inset: 0; z-index: 999999;
+  background: radial-gradient(135deg, #061a0c 0%, #0a3d1c 50%, #061a0c 100%);
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'Source Sans 3', sans-serif;
+}
+#aaf-lock-overlay.hidden { display: none; }
+.aaf-lock-box {
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(16,185,129,0.25);
+  border-radius: 22px;
+  padding: 44px 40px 36px;
+  width: 100%; max-width: 400px;
+  box-shadow: 0 30px 80px rgba(0,0,0,0.5);
+  backdrop-filter: blur(12px);
+  text-align: center;
+}
+.aaf-lock-logo {
+  width: 68px; height: 68px;
+  background: linear-gradient(135deg, #10b981, #059669);
+  border-radius: 18px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 2rem; margin: 0 auto 18px;
+  box-shadow: 0 8px 24px rgba(16,185,129,0.4);
+}
+.aaf-lock-box h2 {
+  font-family: 'Playfair Display', serif;
+  color: #fff; font-size: 1.5rem; margin-bottom: 4px;
+}
+.aaf-lock-box p {
+  color: rgba(255,255,255,0.5); font-size: .82rem; margin-bottom: 28px;
+}
+.aaf-lock-field {
+  margin-bottom: 16px; text-align: left;
+}
+.aaf-lock-field label {
+  display: block; font-size: .72rem; font-weight: 700;
+  color: rgba(255,255,255,0.5); letter-spacing: .8px;
+  text-transform: uppercase; margin-bottom: 6px;
+}
+.aaf-lock-field input {
+  width: 100%; padding: 12px 16px;
+  background: rgba(255,255,255,0.07);
+  border: 1.5px solid rgba(255,255,255,0.12);
+  border-radius: 10px; color: #fff;
+  font-size: .95rem; font-family: inherit;
+  outline: none; transition: border-color .2s;
+}
+.aaf-lock-field input:focus {
+  border-color: #10b981;
+  background: rgba(16,185,129,0.08);
+}
+.aaf-lock-btn {
+  width: 100%; padding: 13px;
+  background: linear-gradient(90deg, #059669, #10b981);
+  border: none; border-radius: 11px; color: #fff;
+  font-size: 1rem; font-weight: 700; cursor: pointer;
+  font-family: inherit; margin-top: 8px;
+  box-shadow: 0 4px 20px rgba(16,185,129,0.35);
+  transition: opacity .2s, transform .15s;
+}
+.aaf-lock-btn:hover { opacity: .92; transform: translateY(-1px); }
+.aaf-lock-err {
+  color: #f87171; font-size: .82rem;
+  margin-top: 10px; min-height: 20px;
+  display: none;
+}
+.aaf-lock-err.show { display: block; }
 </style>
 </head>
 <body>
+
+<!-- 🔐 LOGIN OVERLAY -->
+<div id="aaf-lock-overlay">
+  <div class="aaf-lock-box">
+    <div class="aaf-lock-logo">🌿</div>
+    <h2>Ahsin Agri Farm</h2>
+    <p>Invoice &amp; Database Pro System</p>
+    <div class="aaf-lock-field">
+      <label>🪪 User ID</label>
+      <input type="text" id="aaf-lock-id" placeholder="Enter User ID"
+        onkeydown="if(event.key==='Enter')document.getElementById('aaf-lock-pass').focus()">
+    </div>
+    <div class="aaf-lock-field">
+      <label>🔒 Password</label>
+      <input type="password" id="aaf-lock-pass" placeholder="Enter Password"
+        onkeydown="if(event.key==='Enter')aafCheckLock()">
+    </div>
+    <button class="aaf-lock-btn" onclick="aafCheckLock()">🔓 Login to Invoice System</button>
+    <div class="aaf-lock-err" id="aaf-lock-err">❌ Ghalat ID ya Password!</div>
+  </div>
+</div>
 
 <!-- TOAST CONTAINER -->
 <div class="toast-container" id="toastContainer"></div>
@@ -5517,6 +5608,36 @@ async function settDeleteDescription(custName, descIdx) {
       '<div style="font-size:.85rem;opacity:.8;">' + err.message + '</div>' +
       '<button onclick="location.reload()" style="margin-top:16px;padding:8px 20px;background:#f0c040;border:none;border-radius:6px;cursor:pointer;font-weight:700;">Retry</button>' +
       '</div>';
+  }
+})();
+
+// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 LOGIN FUNCTION \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+function aafCheckLock() {
+  const id   = document.getElementById('aaf-lock-id').value.trim();
+  const pass = document.getElementById('aaf-lock-pass').value;
+  const err  = document.getElementById('aaf-lock-err');
+
+  if (id === 'Waseem Sarfaraz' && pass === 'Nasirkhan45') {  // 🔑 ID: Waseem Sarfaraz | Pass: Nasirkhan45
+    sessionStorage.setItem('aaf_auth', 'yes');
+    const ov = document.getElementById('aaf-lock-overlay');
+    ov.style.transition = 'opacity .5s';
+    ov.style.opacity = '0';
+    setTimeout(() => {
+      ov.classList.add('hidden');
+      ov.style.opacity = '';
+    }, 500);
+  } else {
+    err.classList.add('show');
+    document.getElementById('aaf-lock-pass').value = '';
+    setTimeout(() => err.classList.remove('show'), 3000);
+  }
+}
+
+// Auto-hide if already logged in this session
+(function() {
+  if (sessionStorage.getItem('aaf_auth') === 'yes') {
+    const ov = document.getElementById('aaf-lock-overlay');
+    if (ov) ov.classList.add('hidden');
   }
 })();
 
