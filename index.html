@@ -1,0 +1,3576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Waseem — Different Customer Invoice System</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.5/JsBarcode.all.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://apis.google.com/js/api.js" async defer></script>
+<!-- ✅ Firebase Realtime Database SDK -->
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import { getDatabase, ref, set, onValue, off, serverTimestamp, get } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+
+// ════════════ FIREBASE CONFIG ════════════
+const WS_FB_CONFIG = {
+  apiKey: "AIzaSyCpMSpYI9hr5JdHSnZ0bKgn3uQJ6QybmXw",
+  authDomain: "waseem-sarfaraz-plus.firebaseapp.com",
+  databaseURL: "https://waseem-sarfaraz-plus-default-rtdb.firebaseio.com",
+  projectId: "waseem-sarfaraz-plus",
+  storageBucket: "waseem-sarfaraz-plus.firebasestorage.app",
+  messagingSenderId: "3976430308",
+  appId: "1:3976430308:web:00629a422754391054e2f1"
+};
+
+const WS_FB_NODE = 'wdc_data'; // Alag node — dusri files se mix nahi hoga
+let _wsFbApp, _wsFbDB, _wsFbRef, _wsFbListener = null;
+let _wsFbSaveTimer = null;
+let _wsFbInitialized = false;
+let _wsFbConnected = false;
+
+// ════════════ INIT FIREBASE ════════════
+function wsInitFirebase() {
+  if (_wsFbInitialized) return;
+  try {
+    _wsFbApp = initializeApp(WS_FB_CONFIG, 'wdc_app');
+    _wsFbDB  = getDatabase(_wsFbApp);
+    _wsFbRef = ref(_wsFbDB, WS_FB_NODE);
+    _wsFbInitialized = true;
+
+    // 🔴🟢 Connection status monitor
+    const connRef = ref(_wsFbDB, '.info/connected');
+    onValue(connRef, (snap) => {
+      _wsFbConnected = snap.val() === true;
+      const badge = document.getElementById('ws-sync-badge');
+      if (badge) {
+        if (_wsFbConnected) {
+          badge.textContent = '🟢 Connected';
+          badge.style.color = '#10b981';
+          badge.style.display = 'inline-block';
+          setTimeout(() => { if (badge.textContent === '🟢 Connected') badge.style.display = 'none'; }, 3000);
+        } else {
+          badge.textContent = '🔴 Offline — Local save ho raha hai';
+          badge.style.color = '#ef4444';
+          badge.style.display = 'inline-block';
+        }
+      }
+    });
+
+    console.log('✅ Firebase Realtime DB initialized');
+  } catch(e) {
+    console.error('Firebase init error:', e);
+  }
+}
+
+// ════════════ REALTIME LISTENER — Cloud → App ════════════
+function wsStartRealtimeSync() {
+  if (!_wsFbInitialized) wsInitFirebase();
+  if (_wsFbListener) { off(_wsFbRef, 'value', _wsFbListener); }
+
+  wsSyncBadge('⏳ Cloud se data aa raha hai...', '#d97706');
+
+  _wsFbListener = onValue(_wsFbRef, async (snap) => {
+    const cloud = snap.val();
+    const cloudInvoices = (cloud && Array.isArray(cloud.invoices)) ? cloud.invoices : [];
+    const localCount = (typeof invoices !== 'undefined' && Array.isArray(invoices)) ? invoices.length : 0;
+
+    if (cloudInvoices.length > 0) {
+      // ☁️ Cloud ALWAYS authoritative — update local
+      if (JSON.stringify(invoices) !== JSON.stringify(cloudInvoices)) {
+        invoices = cloudInvoices;
+        if (typeof dbClear === 'function') {
+          await dbClear('invoices');
+          await dbBulkPut('invoices', invoices);
+        }
+        if (typeof renderAll === 'function') renderAll();
+        wsSyncBadge('☁️ Realtime: ' + cloudInvoices.length + ' invoices', '#10b981');
+        setTimeout(wsHideBadge, 3000);
+      }
+
+      // Trash sync bhi
+      if (cloud.trash && Array.isArray(cloud.trash)) {
+        if (JSON.stringify(trashItems) !== JSON.stringify(cloud.trash)) {
+          trashItems = cloud.trash;
+          if (typeof dbClear === 'function') {
+            await dbClear('trash');
+            if (trashItems.length) await dbBulkPut('trash', trashItems);
+          }
+          if (typeof renderTrash === 'function') renderTrash();
+        }
+      }
+
+      // Pending bills sync
+      if (cloud.pendingBills && Array.isArray(cloud.pendingBills)) {
+        localStorage.setItem('aaf_pendingBills', JSON.stringify(cloud.pendingBills));
+        if (typeof renderPendingBills === 'function') renderPendingBills();
+      }
+
+    } else if (localCount > 0) {
+      // Cloud khali hai, local data upload karo
+      wsSyncBadge('⬆️ Pehli baar cloud mein upload...', '#d97706');
+      await wsFbPushAll();
+      wsSyncBadge('✅ Cloud ready! (' + localCount + ' inv)', '#10b981');
+      setTimeout(wsHideBadge, 3000);
+    } else {
+      wsSyncBadge('☁️ Connected — Koi data nahi', '#10b981');
+      setTimeout(wsHideBadge, 2000);
+    }
+  }, (err) => {
+    console.error('Firebase listener error:', err);
+    wsSyncBadge('📴 Offline — Local data use ho raha hai', '#ef4444');
+    setTimeout(wsHideBadge, 4000);
+  });
+}
+
+// ════════════ PUSH DATA → CLOUD ════════════
+async function wsFbPushAll() {
+  if (!_wsFbInitialized) wsInitFirebase();
+  const pb = JSON.parse(localStorage.getItem('aaf_pendingBills') || 'null');
+  const payload = {
+    invoices:     (typeof invoices     !== 'undefined') ? invoices     : [],
+    trash:        (typeof trashItems   !== 'undefined') ? trashItems   : [],
+    pendingBills: pb || [],
+    lastUpdated:  new Date().toISOString(),
+    lastDevice:   navigator.userAgent.substring(0, 80)
+  };
+  await set(_wsFbRef, payload);
+}
+
+// ════════════ DEBOUNCED AUTO-SAVE (500ms delay) ════════════
+function wsFbPush() {
+  clearTimeout(_wsFbSaveTimer);
+  wsSyncBadge('💾 Saving...', '#d97706');
+  _wsFbSaveTimer = setTimeout(async () => {
+    try {
+      await wsFbPushAll();
+      const timeStr = new Date().toLocaleTimeString('en-PK', { hour: '2-digit', minute: '2-digit' });
+      localStorage.setItem('ws_last_sync', timeStr);
+      wsSyncBadge('☁️ Saved at ' + timeStr, '#10b981');
+      setTimeout(wsHideBadge, 4000);
+    } catch(e) {
+      wsSyncBadge('⚠️ Save fail — Internet check karein!', '#ef4444');
+      setTimeout(wsFbPush, 5000); // retry
+    }
+  }, 500);
+}
+
+// ════════════ FORCE UPLOAD ════════════
+async function wsForceUpload() {
+  if (!confirm('PC ka sara data Firebase cloud mein upload karo?')) return;
+  if (!_wsFbInitialized) wsInitFirebase();
+  wsSyncBadge('⬆️ Uploading...', '#d97706');
+  try {
+    await wsFbPushAll();
+    wsSyncBadge('✅ Upload ho gaya!', '#10b981');
+    setTimeout(wsHideBadge, 3000);
+    alert('✅ Data cloud mein aa gaya! Ab mobile par bhi dikhega.');
+  } catch(e) {
+    alert('❌ Upload fail. Internet check karein.');
+    wsSyncBadge('❌ Upload fail', '#ef4444');
+  }
+}
+
+// ════════════ FORCE DOWNLOAD ════════════
+async function wsFbSyncFromCloud() {
+  if (!_wsFbInitialized) wsInitFirebase();
+  wsSyncBadge('⏳ Cloud se data download ho raha hai...', '#d97706');
+  try {
+    const snap = await get(_wsFbRef);
+    const cloud = snap.val();
+    const cloudInvoices = (cloud && Array.isArray(cloud.invoices)) ? cloud.invoices : [];
+
+    if (cloudInvoices.length > 0) {
+      invoices = cloudInvoices;
+      if (typeof dbClear === 'function') {
+        await dbClear('invoices');
+        await dbBulkPut('invoices', invoices);
+      }
+      if (cloud.trash && Array.isArray(cloud.trash)) {
+        trashItems = cloud.trash;
+        if (typeof dbClear === 'function') {
+          await dbClear('trash');
+          if (trashItems.length) await dbBulkPut('trash', trashItems);
+        }
+      }
+      if (typeof renderAll === 'function') renderAll();
+      if (typeof renderTrash === 'function') renderTrash();
+      wsSyncBadge('☁️ Cloud se ' + cloudInvoices.length + ' invoices aa gayi', '#10b981');
+      setTimeout(wsHideBadge, 3000);
+    } else {
+      wsSyncBadge('☁️ Cloud khali hai', '#10b981');
+      setTimeout(wsHideBadge, 2000);
+    }
+  } catch(e) {
+    wsSyncBadge('📴 Offline', '#ef4444');
+    setTimeout(wsHideBadge, 3000);
+  }
+}
+
+// ════════════ BADGE HELPERS ════════════
+function wsSyncBadge(msg, color) {
+  const el = document.getElementById('ws-sync-badge');
+  if (el) { el.textContent = msg; el.style.color = color || '#10b981'; el.style.display = 'inline-block'; }
+}
+function wsHideBadge() {
+  const el = document.getElementById('ws-sync-badge');
+  if (el) el.style.display = 'none';
+}
+
+// ════════════ AUTO INIT ON LOAD ════════════
+document.addEventListener('DOMContentLoaded', () => {
+  wsInitFirebase();
+
+  if (sessionStorage.getItem('ws_auth') === 'yes') {
+    setTimeout(wsStartRealtimeSync, 1200); // Login ke baad realtime start
+  }
+
+  // Tab chhupne par bhi sync
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && typeof invoices !== 'undefined' && invoices.length > 0) {
+      wsFbPushAll().catch(() => {});
+    }
+  });
+
+  // Browser band hone se pehle sync
+  window.addEventListener('beforeunload', () => {
+    if (typeof invoices !== 'undefined' && invoices.length > 0) {
+      const data = JSON.stringify({
+        invoices: invoices,
+        trash:    (typeof trashItems !== 'undefined') ? trashItems : []
+      });
+      navigator.sendBeacon(
+        'https://waseem-sarfaraz-plus-default-rtdb.firebaseio.com/wdc_data.json',
+        new Blob([data], { type: 'application/json' })
+      );
+    }
+  });
+});
+
+// ════════════ GLOBAL EXPORTS (non-module scripts ke liye) ════════════
+window.wsFbPush         = wsFbPush;
+window.wsFbPushAll      = wsFbPushAll;
+window.wsFbSyncFromCloud = wsFbSyncFromCloud;
+window.wsForceUpload    = wsForceUpload;
+window.wsStartRealtimeSync = wsStartRealtimeSync;
+window.wsSyncBadge      = wsSyncBadge;
+window.wsHideBadge      = wsHideBadge;
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400;700&family=Playfair+Display:wght@700;900&family=Source+Sans+3:wght@300;400;600;700&display=swap');
+
+body.lang-ur, body.lang-ur input, body.lang-ur select, body.lang-ur textarea, body.lang-ur button {
+  font-family: 'Noto Nastaliq Urdu', 'Source Sans 3', sans-serif !important;
+}
+body.lang-ur label, body.lang-ur .card-title, body.lang-ur h2, body.lang-ur .btn, body.lang-ur th {
+  line-height: 2.2 !important;
+}
+
+:root {
+  --green: #0a3d1c;
+  --green-light: #10b981;
+  --green-hover: #059669;
+  --green-pale: #f0fdf4;
+  --gold: #d97706;
+  --gold-light: #f59e0b;
+  --dark: #070f09;
+  --gray: #4b5563;
+  --gray-light: #d1d5db;
+  --white: #ffffff;
+  --red: #ef4444;
+  --red-pale: #fee2e2;
+  --shadow: 0 10px 25px -5px rgba(10, 61, 28, 0.06), 0 8px 10px -6px rgba(0, 0, 0, 0.02);
+  --shadow-lg: 0 20px 40px -15px rgba(10, 61, 28, 0.12);
+  --radius: 14px;
+  --radius-sm: 8px;
+  --sidebar-width: 260px;
+  --transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Source Sans 3', sans-serif;
+  background: #f4f8f5;
+  color: var(--dark);
+  min-height: 100vh;
+}
+
+body.dark {
+  --green-pale: #0c1f13;
+  --white: #111f15;
+  --dark: #e8f5ec;
+  --gray-light: #1f3526;
+  --gray: #9ca3af;
+  background: #08100a;
+}
+
+/* APP CONTAINER */
+.app-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* SIDEBAR STYLE */
+.sidebar {
+  width: var(--sidebar-width);
+  background: linear-gradient(135deg, #093318 0%, #051d0e 100%);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 1000;
+  box-shadow: 4px 0 20px rgba(0,0,0,0.15);
+  transition: var(--transition);
+}
+
+.sidebar .brand {
+  margin-bottom: 30px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  padding-bottom: 16px;
+}
+
+.sidebar .brand h2 {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.4rem;
+  letter-spacing: 0.5px;
+  color: #fff;
+}
+
+.sidebar .brand h2 span {
+  color: var(--gold-light);
+}
+
+.sidebar .brand small {
+  font-size: 0.72rem;
+  opacity: 0.7;
+  display: block;
+  margin-top: 4px;
+}
+
+.sidebar nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: transparent;
+  position: static;
+  z-index: auto;
+}
+
+.sidebar nav button {
+  background: none;
+  border: none;
+  color: #a7f3d0;
+  padding: 12px 16px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.88rem;
+  font-weight: 600;
+  text-align: left;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  transition: var(--transition);
+  border-bottom: none;
+}
+
+.sidebar nav button:hover {
+  background: rgba(255,255,255,0.05);
+  color: #fff;
+  transform: translateX(4px);
+}
+
+.sidebar nav button.active {
+  background: linear-gradient(90deg, var(--gold) 0%, var(--gold-light) 100%);
+  color: #fff;
+  box-shadow: 0 4px 15px rgba(217, 119, 6, 0.3);
+}
+
+.sidebar-stats {
+  margin-top: auto;
+  background: rgba(0,0,0,0.2);
+  border-radius: 10px;
+  padding: 16px;
+  border: 1px solid rgba(255,255,255,0.05);
+  margin-bottom: 20px;
+}
+
+.sidebar-stats .stat-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  font-size: 0.8rem;
+}
+
+.sidebar-stats .stat-row:not(:last-child) {
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+
+.sidebar-stats .stat-row span {
+  opacity: 0.7;
+}
+
+.sidebar-stats .stat-row strong {
+  color: var(--gold-light);
+  font-size: 1.05rem;
+}
+
+/* MAIN CONTENT */
+.main-wrapper {
+  margin-left: var(--sidebar-width);
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  transition: var(--transition);
+}
+
+.mobile-nav-header {
+  display: none;
+  background: var(--green);
+  color: #fff;
+  padding: 14px 20px;
+  justify-content: space-between;
+  align-items: center;
+  position: sticky;
+  top: 0;
+  z-index: 999;
+}
+
+.mobile-nav-header h2 {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.15rem;
+}
+
+.mobile-nav-header button {
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 1.5rem;
+  cursor: pointer;
+}
+
+main {
+  max-width: 1200px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 28px 24px 80px;
+}
+/* SECTION HIDE/SHOW */
+.section {
+  display: none;
+  animation: fadeIn 0.2s ease;
+}
+.section.active {
+  display: block;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+
+/* BACKUP BAR */
+.backup-bar {
+  background: var(--white);
+  border-bottom: 1px solid var(--gray-light);
+  padding: 10px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+}
+
+body.dark .backup-bar {
+  background: var(--white);
+  border-bottom-color: var(--gray-light);
+}
+
+/* CARD */
+.card {
+  background: var(--white);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 24px;
+  margin-bottom: 24px;
+  border: 1px solid rgba(16, 185, 129, 0.05);
+  transition: var(--transition);
+}
+
+.card:hover {
+  box-shadow: var(--shadow-lg);
+}
+
+.card-title {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--green);
+  margin-bottom: 20px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--green-pale);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+body.dark .card-title {
+  color: var(--green-light);
+}
+
+/* FORM STYLE */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-group label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--gray);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.form-group input, .form-group select, .form-group textarea {
+  border: 1.5px solid var(--gray-light);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-family: inherit;
+  font-size: 0.9rem;
+  background: var(--white);
+  color: var(--dark);
+  transition: var(--transition);
+}
+
+.form-group input:focus, .form-group select:focus {
+  border-color: var(--green-light);
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+  outline: none;
+}
+
+.form-group input[readonly] {
+  background: #f3f4f6;
+  color: var(--gray);
+  border-color: var(--gray-light);
+  cursor: not-allowed;
+}
+
+body.dark .form-group input[readonly] {
+  background: #0f1c13;
+}
+
+/* BUTTONS */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: none;
+  border-radius: 10px;
+  padding: 10px 22px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.88rem;
+  font-weight: 600;
+  transition: var(--transition);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+
+.btn:active {
+  transform: translateY(0);
+}
+
+.btn-green { background: var(--green); color: #fff; }
+.btn-green:hover { background: #0e4c25; }
+.btn-gold { background: var(--gold); color: #fff; }
+.btn-gold:hover { background: #b45309; }
+.btn-red { background: var(--red); color: #fff; }
+.btn-red:hover { background: #dc2626; }
+.btn-gray { background: var(--gray); color: #fff; }
+.btn-gray:hover { background: #374151; }
+.btn-wa { background: #22c55e; color: #fff; }
+.btn-wa:hover { background: #16a34a; }
+.btn-blue { background: #2563eb; color: #fff; }
+.btn-blue:hover { background: #1d4ed8; }
+.btn-purple { background: #7c3aed; color: #fff; }
+.btn-purple:hover { background: #6d28d9; }
+.btn-sm{padding:5px 12px;font-size:.78rem;}
+.btn-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px;}
+
+/* TABLE */
+.tbl-wrap {
+  overflow-x: auto;
+  border-radius: 12px;
+  border: 1px solid var(--gray-light);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.83rem;
+}
+
+thead tr {
+  background: var(--green);
+  color: #fff;
+}
+
+th {
+  padding: 12px 14px;
+  text-align: left;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+tbody tr {
+  border-bottom: 1px solid var(--gray-light);
+  transition: var(--transition);
+}
+
+tbody tr:hover {
+  background: var(--green-pale);
+}
+
+tbody td {
+  padding: 12px 14px;
+  vertical-align: middle;
+}
+
+tfoot td {
+  font-weight: 700;
+  background: var(--green-pale);
+  border-top: 2px solid var(--green);
+  padding: 12px 14px;
+}
+
+/* ALERT / TOAST */
+.alert{display:none;padding:10px 16px;border-radius:7px;font-size:.88rem;margin-bottom:12px;}
+.alert-success{background:#d4edda;color:#155724;border:1px solid #c3e6cb;}
+.alert-error{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;}
+.toast-container{position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;}
+.toast{background:#1a5c2a;color:#fff;padding:12px 20px;border-radius:8px;font-size:.88rem;box-shadow:0 4px 16px rgba(0,0,0,0.2);animation:slideUp .3s ease;max-width:320px;}
+.toast.error{background:#c0392b;}
+.toast.info{background:#2563eb;}
+@keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+
+/* DASHBOARD */
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.dash-card {
+  background: var(--white);
+  border-radius: 14px;
+  padding: 20px;
+  box-shadow: var(--shadow);
+  border-left: 5px solid var(--green-light);
+  transition: var(--transition);
+}
+
+.dash-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+
+.dash-card.gold { border-left-color: var(--gold); }
+.dash-card.red { border-left-color: var(--red); }
+
+.dash-card label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--gray);
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 700;
+}
+
+.dash-card .val {
+  font-size: 1.75rem;
+  font-weight: 800;
+  color: var(--green);
+}
+
+.dash-card.gold .val { color: var(--gold); }
+.dash-card.red .val { color: var(--red); }
+
+.dash-card .sub-val {
+  font-size: 0.72rem;
+  color: var(--gray);
+  margin-top: 4px;
+}
+
+/* CHART */
+.chart-wrap{overflow-x:auto;padding-bottom:6px;}
+.chart-bars{display:flex;align-items:flex-end;gap:10px;height:140px;min-width:400px;padding:0 4px;}
+.chart-bar-col{display:flex;flex-direction:column;align-items:center;min-width:44px;}
+.chart-bar{background:linear-gradient(to top,var(--green),var(--green-light));border-radius:4px 4px 0 0;width:28px;position:relative;cursor:pointer;transition:opacity .2s;}
+.chart-bar:hover{opacity:.8;}
+.chart-bar .tip{display:none;position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);background:var(--dark);color:#fff;padding:5px 8px;border-radius:5px;font-size:.65rem;white-space:nowrap;z-index:10;}
+.chart-bar:hover .tip{display:block;}
+.chart-label{font-size:.65rem;color:var(--gray);margin-top:4px;}
+.chart-amt{font-size:.6rem;color:var(--green);font-weight:700;}
+
+/* MODAL STYLES */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(6, 15, 9, 0.6);
+  backdrop-filter: blur(4px);
+  z-index: 10000;
+  align-items: center;
+  justify-content: center;
+}
+.modal-overlay.open{display:flex;}
+
+.modal-box {
+  background: var(--white);
+  border-radius: 18px;
+  padding: 30px;
+  max-width: 460px;
+  width: 90%;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+  border: 1px solid rgba(16, 185, 129, 0.1);
+  animation: modalIn 0.3s ease;
+}
+.modal-box h3{font-family:'Playfair Display',serif;color:var(--green);margin-bottom:12px;}
+.modal-box p{color:var(--gray);font-size:.9rem;margin-bottom:20px;}
+
+@keyframes modalIn {
+  from { opacity: 0; transform: scale(0.95) translateY(10px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* PRINT AREA */
+.print-area{display:none;margin-top:20px;}
+.inv-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;}
+.inv-farm h2{font-family:'Playfair Display',serif;color:var(--green);font-size:1.4rem;}
+.inv-farm p{color:var(--gray);font-size:.82rem;}
+.inv-no h3{font-size:1.6rem;font-weight:900;color:var(--green);text-align:right;}
+.inv-no p{color:var(--gray);font-size:.82rem;text-align:right;}
+.inv-divider{border:none;border-top:2px solid var(--green);margin:10px 0;}
+.inv-parties{display:flex;gap:30px;margin-bottom:14px;}
+.inv-party h4{font-size:.72rem;text-transform:uppercase;letter-spacing:.5px;color:var(--gray);margin-bottom:4px;}
+.inv-party p{font-weight:700;color:var(--dark);font-size:1rem;}
+.inv-table table{width:100%;border-collapse:collapse;font-size:.82rem;margin-bottom:14px;}
+.inv-table th{background:var(--green);color:#fff;padding:7px 9px;text-align:left;}
+.inv-table td{padding:6px 9px;border-bottom:1px solid #e4ede6;}
+.inv-table tr:nth-child(even) td{background:#f4faf5;}
+.inv-totals{margin-left:auto;max-width:300px;font-size:.88rem;}
+.inv-totals .row{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #e4ede6;}
+.inv-totals .total{font-weight:700;font-size:1.05rem;color:var(--green);border-bottom:2px solid var(--green);}
+.inv-sig{display:flex;gap:30px;margin-top:30px;margin-bottom:16px;}
+.inv-sig>div{flex:1;text-align:center;}
+.inv-sig .line{border-top:1.5px solid var(--dark);margin-bottom:5px;}
+.inv-sig span{font-size:.72rem;color:var(--gray);}
+.inv-footer{text-align:center;font-size:.7rem;color:var(--gray);border-top:1px solid #e4ede6;padding-top:8px;}
+.inv-qr-bar{display:flex;justify-content:space-between;align-items:center;margin:10px 0;gap:16px;}
+.inv-qr-bar canvas,.inv-qr-bar svg{max-width:80px !important;max-height:80px !important;}
+.inv-barcode{text-align:center;margin:8px 0;}
+.inv-barcode svg{max-width:100%;height:40px;}
+.inv-watermark{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:5rem;color:rgba(26,92,42,.06);font-family:'Playfair Display',serif;pointer-events:none;white-space:nowrap;}
+.print-area-wrapper{position:relative;}
+
+/* TRASH */
+.trash-badge{background:var(--red);color:#fff;border-radius:50%;font-size:.65rem;padding:1px 5px;margin-left:4px;font-weight:700;}
+
+/* QUICK FILTERS */
+.quick-filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;}
+.qf-btn{background:var(--green-pale);color:var(--green);border:1.5px solid var(--green);border-radius:6px;padding:5px 13px;cursor:pointer;font-size:.8rem;font-weight:600;transition:all .15s;}
+.qf-btn:hover,.qf-btn.active{background:var(--green);color:#fff;}
+
+/* LOADING SKELETON */
+.skeleton{background:linear-gradient(90deg,#e8f5eb 25%,#d4edda 50%,#e8f5eb 75%);background-size:200% 100%;animation:shimmer 1.2s infinite;border-radius:4px;}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+
+/* PAGINATION */
+.pagination{display:flex;gap:6px;align-items:center;margin-top:12px;flex-wrap:wrap;}
+.pg-btn{background:#fff;border:1.5px solid var(--gray-light);border-radius:5px;padding:5px 11px;cursor:pointer;font-size:.82rem;font-weight:600;transition:all .15s;}
+.pg-btn:hover,.pg-btn.active{background:var(--green);color:#fff;border-color:var(--green);}
+.pg-btn:disabled{opacity:.4;cursor:not-allowed;}
+
+/* HIGHLIGHT */
+.hl{background:#fff176;border-radius:2px;}
+
+/* MOBILE RESPONSIVE SIDEBAR */
+@media (max-width: 992px) {
+  .sidebar {
+    left: calc(-1 * var(--sidebar-width));
+  }
+  .sidebar.open {
+    left: 0;
+  }
+  .main-wrapper {
+    margin-left: 0;
+  }
+  .mobile-nav-header {
+    display: flex;
+  }
+}
+
+@media(max-width:600px){
+  main{padding:14px 8px 80px;}
+  .form-grid{grid-template-columns:1fr 1fr;}
+  .dash-grid{grid-template-columns:repeat(2,1fr);}
+  .btn{padding:8px 14px;font-size:.83rem;}
+}
+
+/* PRINT */
+@media print {
+  /* Hide everything */
+  .sidebar, .mobile-nav-header, .backup-bar, .no-print,
+  .modal-overlay, .toast-container, header, nav { display:none!important; }
+
+  /* Reset layout for print */
+  .app-layout { display:block!important; }
+  .main-wrapper { margin-left:0!important; padding:0!important; }
+  main { padding:0!important; margin:0!important; max-width:100%!important; }
+
+  /* Hide all sections */
+  main .section { display:none!important; }
+
+  /* Show only invoice section when printing */
+  main #invoice.section { display:block!important; }
+
+  /* Hide everything inside invoice except preview */
+  #invoice .card:first-child,
+  #invoice .alert { display:none!important; }
+
+  /* Show the print area */
+  .print-area { display:block!important; }
+  .print-area-wrapper { display:block!important; }
+
+  /* Remove card shadow for print */
+  .print-area.card {
+    box-shadow: none!important;
+    border: none!important;
+    margin: 0!important;
+    padding: 10px!important;
+  }
+
+  body { background:#fff!important; }
+  @page { size:A4 portrait; margin:8mm 10mm; }
+}
+/* ════════════ PASSWORD LOCK SCREEN ════════════ */
+#ws-lock-overlay {
+  position:fixed;inset:0;z-index:99999;
+  background:radial-gradient(ellipse at 60% 40%,#093318 0%,#040d07 70%,#020805 100%);
+  display:flex;align-items:center;justify-content:center;
+  font-family:'Source Sans 3',sans-serif;
+}
+#ws-lock-overlay.hidden{display:none;}
+.ws-lock-card{
+  background:linear-gradient(145deg,#0d1f11,#122518);
+  border:1px solid rgba(16,185,129,0.2);
+  border-radius:20px;padding:42px 40px 36px;
+  width:100%;max-width:400px;
+  box-shadow:0 24px 64px rgba(0,0,0,0.7);
+  position:relative;overflow:hidden;
+  animation:wsLockIn 0.5s cubic-bezier(.4,0,.2,1);
+}
+@keyframes wsLockIn{
+  from{opacity:0;transform:translateY(28px) scale(0.97);}
+  to{opacity:1;transform:none;}
+}
+.ws-lock-card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,transparent,#10b981,#34d399,transparent);
+  border-radius:20px 20px 0 0;
+}
+.ws-lock-logo{text-align:center;margin-bottom:28px;}
+.ws-lock-icon{
+  width:72px;height:72px;margin:0 auto 14px;
+  background:linear-gradient(135deg,#065f46,#10b981);
+  border-radius:18px;display:flex;align-items:center;
+  justify-content:center;font-size:34px;
+  box-shadow:0 8px 28px rgba(16,185,129,0.4);
+}
+.ws-lock-logo h1{font-size:20px;font-weight:700;color:#34d399;margin:0 0 4px;font-family:'Playfair Display',serif;}
+.ws-lock-logo p{font-size:12px;color:#064e3b;margin:0;}
+.ws-lock-field{margin-bottom:16px;}
+.ws-lock-field label{display:block;font-size:10.5px;font-weight:700;color:#10b981;letter-spacing:.8px;text-transform:uppercase;margin-bottom:7px;}
+.ws-lock-input{
+  width:100%;background:rgba(4,17,9,0.7);
+  border:1px solid rgba(16,185,129,0.2);border-radius:10px;
+  padding:12px 14px;color:#e8f5ec;font-size:14px;
+  font-family:'Source Sans 3',sans-serif;outline:none;
+  transition:border-color .2s,box-shadow .2s;box-sizing:border-box;
+}
+.ws-lock-input:focus{border-color:#10b981;box-shadow:0 0 0 3px rgba(16,185,129,0.12);}
+.ws-lock-input::placeholder{color:#064e3b;}
+.ws-lock-btn{
+  width:100%;margin-top:8px;padding:13px;
+  background:linear-gradient(135deg,#065f46,#059669);
+  border:1px solid #10b981;border-radius:10px;
+  color:#f0fdf4;font-size:14px;font-weight:700;
+  cursor:pointer;font-family:'Source Sans 3',sans-serif;
+  transition:all .2s;box-shadow:0 4px 16px rgba(5,150,105,0.3);
+}
+.ws-lock-btn:hover{background:linear-gradient(135deg,#059669,#10b981);box-shadow:0 6px 24px rgba(16,185,129,0.4);transform:translateY(-1px);}
+.ws-lock-err{
+  display:none;margin-top:12px;padding:10px 14px;
+  background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);
+  border-radius:8px;color:#ef4444;font-size:12.5px;text-align:center;
+  animation:wsShake .4s ease;
+}
+@keyframes wsShake{0%,100%{transform:translateX(0)}20%{transform:translateX(-8px)}40%{transform:translateX(8px)}60%{transform:translateX(-5px)}80%{transform:translateX(5px)}}
+.ws-lock-err.show{display:block;}
+.ws-lock-footer{text-align:center;margin-top:20px;font-size:10.5px;color:#064e3b;}
+</style>
+</head>
+<body>
+
+<!-- ═══ LOCK SCREEN ═══ -->
+<div id="ws-lock-overlay">
+  <div class="ws-lock-card">
+    <div class="ws-lock-logo">
+      <div class="ws-lock-icon">🌿</div>
+      <h1>Waseem — Different Customer</h1>
+      <p>Invoice & Database System</p>
+    </div>
+    <div class="ws-lock-field">
+      <label>🪪 User ID</label>
+      <input type="text" id="ws-lock-id" class="ws-lock-input" placeholder="Enter your ID" autocomplete="off">
+    </div>
+    <div class="ws-lock-field">
+      <label>🔐 Password</label>
+      <input type="password" id="ws-lock-pass" class="ws-lock-input" placeholder="Enter your password" autocomplete="off">
+    </div>
+    <button class="ws-lock-btn" onclick="wsCheckLock()">🔓 Login to Invoice System</button>
+    <div class="ws-lock-err" id="ws-lock-err">❌ Galat ID ya Password — dobara try karein</div>
+    <div class="ws-lock-footer">🔒 Protected System — Sirf Authorized Users</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  if(sessionStorage.getItem('ws_auth')==='yes'){
+    document.getElementById('ws-lock-overlay').classList.add('hidden');
+  }
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Enter' && !document.getElementById('ws-lock-overlay').classList.contains('hidden'))
+      wsCheckLock();
+  });
+})();
+
+function wsCheckLock(){
+  var id   = document.getElementById('ws-lock-id').value.trim();
+  var pass = document.getElementById('ws-lock-pass').value;
+  var err  = document.getElementById('ws-lock-err');
+  if(id==='Waseem Sarfaraz' && pass==='Nasirkhan45'){  // 🔑 Login: ID=Waseem Sarfaraz  Password=Nasirkhan45
+    sessionStorage.setItem('ws_auth','yes');
+    var ov = document.getElementById('ws-lock-overlay');
+    ov.style.transition='opacity .5s';
+    ov.style.opacity='0';
+    setTimeout(function(){
+      ov.classList.add('hidden');
+      ov.style.opacity='';
+      // ☁️ Realtime sync shuru karo login ke baad
+      if(typeof window.wsStartRealtimeSync === 'function') {
+        window.wsStartRealtimeSync();
+      } else if(typeof window.wsFbSyncFromCloud === 'function') {
+        window.wsFbSyncFromCloud();
+      }
+    },500);
+  } else {
+    err.classList.add('show');
+    err.style.animation='none';
+    setTimeout(function(){ err.style.animation=''; },10);
+    document.getElementById('ws-lock-pass').value='';
+    document.getElementById('ws-lock-pass').focus();
+  }
+}
+</script>
+
+<!-- ═══ FIREBASE REALTIME SYNC — Module script ke through handle hota hai ═══ -->
+<script>
+// \u2705 Yeh functions module script (type="module") ne window par expose kiye hain:
+//   window.wsFbPush, wsFbPushAll, wsFbSyncFromCloud, wsForceUpload
+//   window.wsStartRealtimeSync, wsSyncBadge, wsHideBadge
+// In functions ko aap seedha call kar sakte hain.
+</script>
+
+<!-- TOAST CONTAINER -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- DELETE MODAL -->
+<div class="modal-overlay" id="deleteModal">
+  <div class="modal-box">
+    <h3>🗑️ Delete Invoice</h3>
+    <p id="deleteModalMsg">Are you sure you want to move this invoice to Trash?</p>
+    <div class="btn-row">
+      <button class="btn btn-red" onclick="confirmDeleteAction()">Move to Trash</button>
+      <button class="btn btn-gray" onclick="closeModal('deleteModal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- PERM DELETE MODAL -->
+<div class="modal-overlay" id="permDeleteModal">
+  <div class="modal-box">
+    <h3>⚠️ Permanent Delete</h3>
+    <p id="permDeleteMsg">This will permanently delete the invoice. This cannot be undone!</p>
+    <div class="btn-row">
+      <button class="btn btn-red" onclick="confirmPermDelete()">Delete Forever</button>
+      <button class="btn btn-gray" onclick="closeModal('permDeleteModal')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- APP LAYOUT CONTAINER -->
+<div class="app-layout">
+
+  <!-- SIDEBAR (Aside Navigation) -->
+  <aside class="sidebar no-print">
+    <div class="brand">
+      <h2>🌿 Waseem <span>Different Customer</span></h2>
+      <small>Invoice & Database Pro System</small>
+    </div>
+    
+    <nav>
+      <button onclick="showTab('invoice')" data-translate="navNewInvoice">🧾 New Invoice</button>
+      <button onclick="showTab('dashboard')" data-translate="navDashboard">📊 Dashboard</button>
+      <button onclick="showTab('database')" data-translate="navDatabase">🗄️ Database</button>
+      <button onclick="showTab('reports')" data-translate="navReports">📈 Reports</button>
+      <button onclick="showTab('pending')" >⚠️ Pending Bills</button>
+      <button onclick="showTab('settings')" data-translate="navSettings">⚙️ Settings</button>
+      <button onclick="showTab('trash')" id="trashNavBtn" data-translate="navTrash">🗑️ Trash</button>
+    </nav>
+
+    <!-- Sidebar Dynamic Stats -->
+    <div class="sidebar-stats">
+      <div class="stat-row">
+        <span data-translate="statInvoices">Invoices</span>
+        <strong id="hTotalInv">0</strong>
+      </div>
+      <div class="stat-row">
+        <span data-translate="statAmount">Total Amount</span>
+        <strong id="hTotalAmt">0</strong>
+      </div>
+      <div class="stat-row">
+        <span data-translate="statWeight">Total Net Wt</span>
+        <strong id="hTotalKg">0</strong>
+      </div>
+    </div>
+
+    <!-- Sidebar footer (Dark Mode and Language buttons) -->
+    <div style="margin-top: auto; display: flex; flex-direction: column; gap: 8px;">
+      <button class="btn btn-sm" id="langToggleBtn" onclick="toggleLanguage()" style="background:rgba(255,255,255,0.08); color:#fff; width: 100%; border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; justify-content: center; font-size: 0.8rem;">🇵🇰 Urdu</button>
+      <button class="btn btn-sm" id="darkBtn" onclick="toggleDark()" style="background:rgba(255,255,255,0.08); color:#fff; width: 100%; border: 1px solid rgba(255,255,255,0.15); border-radius: 8px; justify-content: center; font-size: 0.8rem;">🌙 Dark Mode</button>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT AREA WRAPPER -->
+  <div class="main-wrapper">
+    
+    <!-- MOBILE STICKY HEADER -->
+    <header class="mobile-nav-header no-print">
+      <h2 data-translate="mobileTitle">🌿 Ahsin Agri Farm</h2>
+      <button id="mobileMenuBtn" onclick="toggleMobileMenu()">☰</button>
+    </header>
+
+    <!-- BACKUP BAR (Moved inside wrapper) -->
+    <div class="backup-bar no-print">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <span style="color:var(--gold);font-size:.75rem;font-weight:700;" data-translate="backupLabel">💾 Backup:</span>
+        <button class="btn btn-gold btn-sm" onclick="downloadBackup()" data-translate="btnDownloadJson">⬇️ JSON</button>
+        <button class="btn btn-green btn-sm" onclick="exportXLSX()" data-translate="btnExportExcel">📊 Excel</button>
+        <button class="btn btn-gray btn-sm" onclick="document.getElementById('restoreFileInput').click()" data-translate="btnRestoreLocal">📂 Restore</button>
+        <input type="file" id="restoreFileInput" accept=".json" onchange="restoreBackup(this)" style="display:none">
+        <button class="btn btn-blue btn-sm" onclick="document.getElementById('mergeFileInput').click()" data-translate="btnMergeLocal">🔀 Merge</button>
+        <input type="file" id="mergeFileInput" accept=".json" multiple onchange="mergeBackup(this)" style="display:none">
+        <button class="btn btn-red btn-sm" onclick="resetAllData()" data-translate="btnResetData">🗑️ Reset</button>
+        <button class="btn btn-green btn-sm" onclick="wsForceUpload()" style="background:#065f46;">☁️ Upload to Cloud</button>
+        <span id="ws-sync-badge" style="display:none;font-size:.72rem;font-weight:700;padding:3px 10px;border-radius:99px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.25);color:#10b981;white-space:nowrap;"></span>
+        <span class="backup-status" id="backupStatus" style="font-size: 0.72rem; color: var(--green);"></span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;" id="driveBar">
+        <div id="driveSignedOut" style="display:flex;gap:8px;align-items:center;">
+          <button class="btn btn-blue btn-sm" onclick="gdriveSignIn()">☁️ Google Drive</button>
+        </div>
+        <div id="driveSignedIn" style="display:none;gap:8px;align-items:center;">
+          <span id="driveUserName" style="color:#d97706;font-size:.75rem;font-weight:700;"></span>
+          <button class="btn btn-blue btn-sm" onclick="gdriveBackup()">☁️ Save</button>
+          <button class="btn btn-gray btn-sm" onclick="gdriveRestore()">☁️ Restore</button>
+          <button class="btn btn-red btn-sm" onclick="gdriveSignOut()">Sign Out</button>
+        </div>
+        <span id="driveStatus" style="font-size:.72rem;display:none;"></span>
+      </div>
+    </div>
+
+    <main>
+
+<!-- ══════════ INVOICE TAB ══════════ -->
+<div id="invoice" class="section active">
+  <div class="card">
+    <div class="card-title" data-translate="invoiceTitle">🧾 Create New Invoice</div>
+    <div id="invAlert" class="alert"></div>
+    <div class="form-grid">
+      <div class="form-group"><label>Invoice #</label><input type="text" id="invNo" readonly placeholder="Auto"></div>
+      <div class="form-group"><label data-translate="lblDate">Date</label><input type="date" id="invDate" onfocus="clearErr(this)"></div>
+      <div class="form-group">
+        <label data-translate="lblDescription">Description</label>
+        <select id="invDesc" onchange="onDescChange()">
+          <option value="Ice Burg Basket">Ice Burg Basket</option>
+          <option value="Ice Burg Box/Carton">Ice Burg Box/Carton</option>
+        </select>
+      </div>
+      <div class="form-group"><label>Customer Name</label><input type="text" id="invDescCustom" value="Sarfaraz Abbasi" placeholder="Customer name"></div>
+      <div class="form-group"><label id="qtyLabel">Quantity (Baskets)</label><input type="number" id="invQty" step="1" min="0" placeholder="Number of baskets" oninput="autoCalcNeatWt()"></div>
+      <div class="form-group"><label data-translate="lblTotalWeight">Total Weight (KG)</label><input type="number" id="invTotalWt" step="0.01" min="0" oninput="autoCalcNeatWt()"></div>
+      <div class="form-group"><label id="tareLabel">Basket Tare Wt (KG) <span style="color:var(--gold);font-size:.72rem;">default 1.5</span></label><input type="number" id="invTareWt" step="0.01" min="0" value="1.5" oninput="autoCalcNeatWt()" placeholder="1.5"></div>
+      <div class="form-group"><label>Neat Weight (KG) — Auto</label><input type="number" id="invNeatWt" step="0.01" min="0" oninput="calcWaste()" placeholder="Auto"></div>
+      <div class="form-group"><label id="wastePctLabel">Wastage % <span style="color:var(--gold);font-size:.72rem;">(default 15%)</span></label><input type="number" id="invWastePct" step="0.01" min="0" max="100" value="15" oninput="calcWaste()" placeholder="15"></div>
+      <div class="form-group"><label>Wastage (KG) — Auto</label><input type="number" id="invWaste" step="0.01" readonly></div>
+      <div class="form-group"><label>Neat Wt After Wastage (KG) — Auto</label><input type="number" id="invNeatAfter" step="0.01" readonly></div>
+      <div class="form-group"><label data-translate="lblRate">Rate (Rs/KG)</label><input type="number" id="invRate" step="0.01" min="0" value="90" oninput="calcAmount()" onfocus="clearErr(this)"></div>
+      <div class="form-group"><label>Amount (Rs) — Auto</label><input type="number" id="invAmount" readonly></div>
+      <div class="form-group"><label>Received By</label><input type="text" id="invPerson" list="personList" value="Sarfaraz Abbasi" placeholder="Name of receiver" onfocus="clearErr(this)"><datalist id="personList"></datalist></div>
+      <div class="form-group"><label>Notes</label><input type="text" id="invNotes" placeholder="Optional notes"></div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-green" onclick="saveInvoice()">💾 Save Invoice</button>
+      <button class="btn btn-gold" onclick="generatePreview()">👁️ Preview</button>
+      <button class="btn btn-gray" onclick="clearForm()">✖ Clear</button>
+    </div>
+  </div>
+
+  <!-- INVOICE PREVIEW / PRINT -->
+  <div class="print-area-wrapper">
+    <div id="invoicePreview" class="print-area card" style="position:relative;">
+      <div class="inv-watermark">AHSIN AGRI FARM</div>
+      <div class="inv-header">
+        <div class="inv-farm">
+          <h2 data-translate="mobileTitle">🌿 Ahsin Agri Farm</h2>
+          <p>Khanpur Shinkiari, Mansehra, KPK</p>
+          <p>Phone: 0300-9871404</p>
+        </div>
+        <div class="inv-no">
+          <h3 id="pInvNo">AAF-001</h3>
+          <p id="pInvDate">—</p>
+          <p style="font-size:.72rem;color:var(--gold);">OFFICIAL INVOICE</p>
+        </div>
+      </div>
+
+      <!-- QR + Barcode bar -->
+      <div class="inv-qr-bar">
+        <div>
+          <div id="qrCode"></div>
+          <div style="font-size:.6rem;color:var(--gray);margin-top:2px;text-align:center;">Scan to Verify</div>
+        </div>
+        <div style="flex:1;">
+          <div class="inv-barcode"><svg id="barcodeEl"></svg></div>
+        </div>
+        <div style="text-align:right;font-size:.72rem;color:var(--gray);">
+          <div>Print Date: <b id="pPrintDate"></b></div>
+          <div>Print Time: <b id="pPrintTime"></b></div>
+          <div style="margin-top:4px;font-size:.65rem;color:#aaa;">Generated by AAF Pro System</div>
+        </div>
+      </div>
+
+      <hr class="inv-divider">
+      <div class="inv-parties">
+        <div class="inv-party">
+          <h4>From</h4>
+          <p>Ahsin Agri Farm</p>
+          <p style="font-weight:400;font-size:.82rem;color:var(--gray)">Shoukat — Khanpur Shinkiari</p>
+        </div>
+        <div class="inv-party">
+          <h4>Received By</h4>
+          <p id="pPerson">Sarfaraz Abbasi</p>
+        </div>
+      </div>
+      <div class="inv-table">
+        <table>
+          <thead><tr>
+            <th data-translate="thDescription">Description</th><th data-translate="thQty">Qty</th><th data-translate="thTotalWt">Total Wt (KG)</th>
+            <th data-translate="thNeatWt">Neat Wt (KG)</th><th data-translate="thWastage">Wastage (KG)</th><th>Neat Wt After Wastage</th>
+            <th>Rate (Rs/KG)</th><th data-translate="thAmount">Amount (Rs)</th>
+          </tr></thead>
+          <tbody id="pTableBody"></tbody>
+        </table>
+      </div>
+      <div class="inv-totals">
+        <div class="row"><span>Neat Wt After Wastage:</span><span id="pNeatAfter">0 KG</span></div>
+        <div class="row"><span>Rate per KG:</span><span id="pRate">Rs 0</span></div>
+        <div class="row total"><span>TOTAL AMOUNT:</span><span id="pTotal">Rs 0</span></div>
+      </div>
+
+      <!-- Terms -->
+      <div style="margin-top:14px;font-size:.68rem;color:var(--gray);border:1px dashed #cdd9cf;padding:8px 12px;border-radius:6px;">
+        <b>Terms & Conditions:</b> This invoice is system-generated and valid without signature. All weights measured at farm. Wastage percentage as per industry standard. Any disputes must be reported within 48 hours.
+      </div>
+
+      <div class="inv-sig">
+        <div><div class="line"></div><span>Prepared By</span></div>
+        <div><div class="line"></div><span>Received By</span></div>
+        <div><div class="line"></div><span>Verified By</span></div>
+      </div>
+      <div class="inv-footer">
+        Ahsin Agri Farm — Shoukat, Khanpur Shinkiari, Mansehra, KPK | AAF Invoice Management Pro System
+      </div>
+      <div class="btn-row no-print" style="margin-top:16px;">
+        <button class="btn btn-green" onclick="printInvoice()">🖨️ Print</button>
+        <button class="btn btn-purple" onclick="downloadPDF()">📄 PDF</button>
+        <button class="btn btn-wa" onclick="shareWhatsApp()">📲 WhatsApp</button>
+        <button class="btn btn-gray" onclick="document.getElementById('invoicePreview').style.display='none'">✖ Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ DASHBOARD TAB ══════════ -->
+<div id="dashboard" class="section">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
+      <div class="card-title" style="margin:0;border:none;padding:0;">📊 Dashboard Overview</div>
+      <div id="dashFilterLabel" style="font-size:.78rem;color:var(--gold);font-weight:600;"></div>
+    </div>
+    <div class="quick-filters">
+      <button class="qf-btn" onclick="setDashFilter('today')">📅 Today</button>
+      <button class="qf-btn" onclick="setDashFilter('week')">📆 This Week</button>
+      <button class="qf-btn" onclick="setDashFilter('month')">🗓️ This Month</button>
+      <button class="qf-btn" onclick="setDashFilter('3months')">📊 3 Months</button>
+      <button class="qf-btn" onclick="setDashFilter('year')">📈 This Year</button>
+      <button class="qf-btn" onclick="setDashFilter('all')">🔄 All</button>
+    </div>
+    <div class="dash-grid">
+      <div class="dash-card gold"><label data-translate="lblAmount">Total Amount (Rs)</label><div class="val" id="dTotalAmt">0</div></div>
+      <div class="dash-card"><label>Total Invoices</label><div class="val" id="dTotalInv">0</div></div>
+      <div class="dash-card"><label>Net Wt After Wastage (KG)</label><div class="val" id="dNetAfterWaste">0</div></div>
+      <div class="dash-card"><label>Total Neat Wt (KG)</label><div class="val" id="dTotalKg">0</div></div>
+      <div class="dash-card red"><label>Total Wastage (KG)</label><div class="val" id="dTotalWaste">0</div></div>
+      <div class="dash-card"><label>Total Tare Wt (KG)</label><div class="val" id="dTotalTare">0</div></div>
+      <div class="dash-card"><label>Unique Customers</label><div class="val" id="dPersons">0</div></div>
+      <div class="dash-card gold"><label>Today's Invoices</label><div class="val" id="dToday">0</div></div>
+    </div>
+    <div style="font-size:.78rem;color:var(--gray);margin-bottom:10px;" id="dNetCalc"></div>
+  </div>
+
+  <!-- Chart -->
+  <div class="card">
+    <div class="card-title">📊 Monthly Revenue Chart</div>
+    <div class="chart-wrap"><div class="chart-bars" id="chartBars"></div></div>
+  </div>
+
+  <!-- Recent -->
+  <div class="card">
+    <div class="card-title">🕒 Recent Invoices</div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Inv#</th><th data-translate="thDate">Date</th><th data-translate="thDescription">Description</th><th data-translate="thQty">Qty</th><th>Net After W</th><th>Rate</th><th>Amount</th><th>Person</th></tr></thead>
+        <tbody id="recentBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ DATABASE TAB ══════════ -->
+<div id="database" class="section">
+  <div class="card">
+    <div class="card-title">🗄️ All Invoice Records</div>
+    <div class="search-bar">
+      <input type="text" id="searchTxt" placeholder="🔍 Search invoice#, person, description, amount, date..." oninput="debouncedSearch()">
+      <select id="filterMonth" onchange="renderDB()"><option value="">All Months</option></select>
+      <button class="btn btn-green btn-sm" onclick="exportCSV()">⬇️ CSV</button>
+      <button class="btn btn-purple btn-sm" onclick="exportXLSX()">📊 Excel</button>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>Inv#</th><th data-translate="thDate">Date</th><th data-translate="thDescription">Description</th><th data-translate="thQty">Qty</th>
+          <th>Total Wt</th><th>Neat Wt</th><th>Wastage</th><th>Net After W</th>
+          <th>Rate</th><th>Amount</th><th>Person</th><th data-translate="thActions">Actions</th>
+        </tr></thead>
+        <tbody id="dbBody"></tbody>
+      </table>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-top:10px;">
+      <div id="dbSummary" style="font-size:.82rem;color:var(--gray);"></div>
+      <div class="pagination" id="dbPagination"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ REPORTS TAB ══════════ -->
+<div id="reports" class="section">
+  <div class="card">
+    <div class="card-title" data-translate="reportsTitle">📈 Reports & Analytics</div>
+    <div class="quick-filters">
+      <button class="qf-btn" onclick="setQuickFilter('today')">📅 Today</button>
+      <button class="qf-btn" onclick="setQuickFilter('week')">📆 This Week</button>
+      <button class="qf-btn" onclick="setQuickFilter('month')">🗓️ This Month</button>
+      <button class="qf-btn" onclick="setQuickFilter('3months')">📊 3 Months</button>
+      <button class="qf-btn" onclick="setQuickFilter('year')">📈 This Year</button>
+      <button class="qf-btn" onclick="setQuickFilter('all')">🔄 All</button>
+    </div>
+    <div class="form-grid" style="max-width:600px;">
+      <div class="form-group"><label data-translate="lblFromDate">From Date</label><input type="date" id="rptFrom"></div>
+      <div class="form-group"><label data-translate="lblToDate">To Date</label><input type="date" id="rptTo"></div>
+      <div class="form-group"><label data-translate="lblFilterPerson">Filter by Person</label><input type="text" id="rptPerson" list="personList2" placeholder="All persons"><datalist id="personList2"></datalist></div>
+      <div class="form-group"><label>Packaging Type</label><select id="rptPackType"><option value="">All Types</option><option value="basket">🧺 Ice Burg Basket</option><option value="box">📦 Iceberg Carton / Box</option></select></div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-green" onclick="generateReport()" data-translate="btnGenReport">📊 Generate Report</button>
+      <button class="btn btn-gray" onclick="clearReport()" data-translate="btnClearReport">✖ Clear</button>
+    </div>
+  </div>
+
+  <div id="reportResult" style="display:none;">
+    <div class="card">
+      <div class="card-title" data-translate="reportSummaryTitle">📋 Report Summary</div>
+      <div class="dash-grid" id="rptCards"></div>
+    </div>
+    <div class="card">
+      <div class="card-title" data-translate="reportDetailTitle">📄 Report Detail</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+        <button class="btn btn-green btn-sm" onclick="printReport()" data-translate="btnPrintReport">🖨️ Print Report</button>
+        <button class="btn btn-purple btn-sm" onclick="exportReportPDF()" data-translate="btnReportPDF">📄 PDF</button>
+        <button class="btn btn-gold btn-sm" onclick="exportReportXLSX()" data-translate="btnReportExcel">📊 Excel</button>
+        <button class="btn btn-gray btn-sm" onclick="exportReportCSV()" data-translate="btnReportCSV">⬇️ CSV</button>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Inv#</th><th data-translate="thDate">Date</th><th data-translate="thDescription">Description</th><th data-translate="thQty">Qty</th><th>Total Wt</th><th>Neat Wt</th><th>Wastage</th><th>Net After W</th><th>Rate</th><th>Amount</th><th>Person</th></tr></thead>
+          <tbody id="rptBody"></tbody>
+          <tfoot id="rptFoot"></tfoot>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ TRASH TAB ══════════ -->
+<!-- ══════════ PENDING BILLS TAB ══════════ -->
+<div id="pending" class="section">
+  <div class="card">
+    <div class="card-title">⚠️ Pending Bills</div>
+    <p style="font-size:.82rem;color:var(--gray);margin-bottom:14px;">Yahan pending bills manage karein — yeh sab print report ke end mein automatically show honge.</p>
+
+    <!-- Add / Edit Form -->
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:18px;">
+      <div style="font-size:.85rem;font-weight:600;color:var(--primary);margin-bottom:10px;" id="pbFormTitle">➕ Naya Pending Bill</div>
+      <input type="hidden" id="pbEditId">
+      <div class="form-grid">
+        <div class="form-group"><label>Person Name</label><input type="text" id="pbPerson" placeholder="e.g. Sarfaraz Abbasi"></div>
+        <div class="form-group"><label>Date</label><input type="date" id="pbDate"></div>
+        <div class="form-group"><label>Description</label><input type="text" id="pbDesc" placeholder="e.g. Naran, Bakaya Mansehra"></div>
+        <div class="form-group"><label>Contact / Note</label><input type="text" id="pbContact" placeholder="Phone ya note"></div>
+        <div class="form-group"><label>Amount (Rs)</label><input type="number" id="pbAmount" placeholder="0"></div>
+        <div class="form-group"><label>Status</label>
+          <select id="pbStatus">
+            <option value="Pending">🔴 Pending</option>
+            <option value="Partial">🟡 Partial</option>
+            <option value="Cleared">🟢 Cleared</option>
+          </select>
+        </div>
+      </div>
+      <div class="btn-row" style="margin-top:8px;">
+        <button class="btn btn-green" onclick="savePendingBill()">💾 Save</button>
+        <button class="btn btn-gray" onclick="cancelPbEdit()">✖ Cancel</button>
+      </div>
+    </div>
+
+    <!-- Table -->
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Person</th><th>Date</th><th>Description</th><th>Contact</th><th>Amount</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody id="pbBody"></tbody>
+        <tfoot>
+          <tr>
+            <td colspan="5" style="font-weight:700;">Total Pending (Cleared ke baghair)</td>
+            <td colspan="2" style="font-weight:700;color:#c0392b;" id="pbTotal">Rs 0</td>
+            <td></td>
+          </tr>
+          <tr style="border-top:3px solid #1a5c2a;">
+            <td colspan="5" style="font-weight:700;color:#1a5c2a;padding:6px;">🧾 Grand Total (Report + Pending)</td>
+            <td colspan="2" style="font-weight:700;color:#1a5c2a;font-size:.9rem;" id="pbGrandTotal">Rs —</td>
+            <td></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="trash" class="section">
+  <div class="card">
+    <div class="card-title">🗑️ Recycle Bin</div>
+    <p style="font-size:.82rem;color:var(--gray);margin-bottom:14px;">Deleted invoices are kept here for 30 days before permanent deletion.</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Inv#</th><th data-translate="thDate">Date</th><th data-translate="thDescription">Description</th><th>Amount</th><th>Person</th><th>Deleted On</th><th data-translate="thActions">Actions</th></tr></thead>
+        <tbody id="trashBody"></tbody>
+      </table>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn btn-red btn-sm" onclick="emptyTrash()">🗑️ Empty Trash</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ SETTINGS TAB ══════════ -->
+<div id="settings" class="section">
+  <div class="card">
+    <div class="card-title" data-translate="settingsTitle">⚙️ System Default Settings</div>
+    <div id="settingsAlert" class="alert"></div>
+    
+    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px;">
+      
+      <!-- Ice Burg Basket Defaults -->
+      <div style="background: var(--green-pale); padding: 18px; border-radius: 12px; border: 1px solid var(--gray-light);">
+        <h4 style="color: var(--green); margin-bottom: 12px; font-family: 'Playfair Display', serif;" data-translate="basketTitle">🧺 Ice Burg Basket Defaults</h4>
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label data-translate="lblDefRate">Default Rate (Rs/KG)</label>
+          <input type="number" id="setBasketRate" step="0.01" min="0">
+        </div>
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label data-translate="lblDefTare">Default Tare Wt (KG)</label>
+          <input type="number" id="setBasketTare" step="0.01" min="0">
+        </div>
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label data-translate="lblDefWaste">Default Wastage %</label>
+          <input type="number" id="setBasketWaste" step="0.01" min="0" max="100">
+        </div>
+      </div>
+
+      <!-- Ice Burg Carton Defaults -->
+      <div style="background: var(--green-pale); padding: 18px; border-radius: 12px; border: 1px solid var(--gray-light);">
+        <h4 style="color: var(--green); margin-bottom: 12px; font-family: 'Playfair Display', serif;" data-translate="cartonTitle">📦 Ice Burg Box/Carton Defaults</h4>
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label data-translate="lblDefRate">Default Rate (Rs/KG)</label>
+          <input type="number" id="setCartonRate" step="0.01" min="0">
+        </div>
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label data-translate="lblDefTare">Default Tare Wt (KG)</label>
+          <input type="number" id="setCartonTare" step="0.01" min="0">
+        </div>
+        <div class="form-group" style="margin-bottom: 12px;">
+          <label data-translate="lblDefWaste">Default Wastage %</label>
+          <input type="number" id="setCartonWaste" step="0.01" min="0" max="100">
+        </div>
+      </div>
+
+    </div>
+    
+          <!-- Local Disk Auto-Backup Configuration -->
+      <div style="background: var(--green-pale); padding: 18px; border-radius: 12px; border: 1px solid var(--gray-light); grid-column: span 2; margin-top: 15px;">
+        <h4 style="color: var(--green); margin-bottom: 12px; font-family: 'Playfair Display', serif;">💾 Local Disk Auto-Backup</h4>
+        <p style="font-size: 0.8rem; color: var(--gray); margin-bottom: 15px;">
+          Kyunki Google Drive security rules ki wajah se direct local file (`file:///`) se block ho jata hai, aap local disk auto-backup feature use kar sakte hain.
+          Ek dafa file select kar lein, to jab bhi aap invoice save, delete, ya restore karenge, backup file background mein automatic write (update) hoti rahegi!
+        </p>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+          <button class="btn btn-gold btn-sm" onclick="setupLocalBackup()">📁 Select Backup File</button>
+          <button class="btn btn-green btn-sm" id="btnGrantBackup" onclick="grantBackupPermission()" style="display: none;">🔑 Enable Auto-Backup</button>
+          <span id="localBackupStatus" style="font-size: 0.8rem; font-weight: 700; color: var(--gray);">Auto-Backup: Not Configured</span>
+        </div>
+      </div>
+
+            <!-- In-Browser Backup History Panel -->
+      <div style="background: var(--green-pale); padding: 18px; border-radius: 12px; border: 1px solid var(--gray-light); grid-column: span 2; margin-top: 15px;">
+        <h4 style="color: var(--green); margin-bottom: 12px; font-family: 'Playfair Display', serif;" data-translate="backupHistoryTitle">🗂️ In-Browser Backup History (Last 10 Checkpoints)</h4>
+        <p style="font-size: 0.8rem; color: var(--gray); margin-bottom: 15px;" data-translate="backupHistoryDesc">
+          Aap yahan manually checkpoint bana sakte hain, ya pichle automatic backups me se kisi bhi version ko 1-second mein restore kar sakte hain.
+        </p>
+        <div style="margin-bottom: 15px;">
+          <button class="btn btn-green btn-sm" onclick="createManualCheckpoint()" data-translate="btnCreateCheckpoint">➕ Create Checkpoint</button>
+        </div>
+        <div id="backupHistoryList" style="display: flex; flex-direction: column; gap: 10px;">
+          <!-- Rendered dynamically -->
+        </div>
+      </div>
+
+<div class="btn-row" style="margin-top: 20px;">
+      <button class="btn btn-green" onclick="saveSettings()" data-translate="btnSaveSettings">💾 Save Settings</button>
+      <button class="btn btn-gray" onclick="loadSettingsToForm()">🔄 Reset Form</button>
+    </div>
+  </div>
+</div>
+
+</main>
+  </div> <!-- main-wrapper -->
+</div> <!-- app-layout -->
+
+<script>
+// ════════════════════════════════════════════════════════
+//  AHSIN AGRI FARM PRO — MAIN JS
+// ════════════════════════════════════════════════════════
+
+// ── DATA STORE ──
+let invoices = [];
+let trashItems = [];
+let currentReport = [];
+let editingId = null;
+let dashFilterMode = 'all';
+let dbPage = 1;
+const PAGE_SIZE = 25;
+
+// ── PRODUCT DEFAULTS ──
+// Short description for print/reports
+function fmtDate(d){ if(!d) return '—'; const p=d.split('-'); return p.length===3?`${p[2]}-${p[1]}-${p[0]}`:d; }
+function shortDesc(desc) {
+  if (!desc) return '';
+  return desc.replace('Ice Burg Box/Carton', 'Iceburg Carton');
+}
+
+const PRODUCT_DEFAULTS = {
+  'Ice Burg Basket':    { wastePct:15, tareWt:1.5, rate:90  },
+  'Ice Burg Box/Carton':{ wastePct:15, tareWt:1.0, rate:105 },
+};
+
+// ── INITIAL DATA ──
+// SEED_DATA is intentionally empty — all real data comes from Firebase cloud.
+// Do NOT add hardcoded invoices here to avoid duplicates after sync.
+const SEED_DATA = [];
+
+// ════════════════════════════════════════════════════════
+//  STORAGE — IndexedDB (primary) + localStorage (fallback)
+// ════════════════════════════════════════════════════════
+const DB_NAME    = 'WDC_PRO_DB'; // Alag DB — Waseem sarfaraz.html se bilkul alag
+const DB_VERSION = 3;
+let   db         = null;
+let   useLS      = false; // fallback flag
+
+const LS = {
+  get: (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch(e) { console.error('LS set error', e); } },
+};
+
+// ── OPEN / INIT DB ──
+function initDB() {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      const timer = setTimeout(() => {
+        console.warn('IndexedDB timeout — switching to localStorage');
+        useLS = true; resolve();
+      }, 3000);
+
+      req.onupgradeneeded = function(e) {
+        const database = e.target.result;
+        if (!database.objectStoreNames.contains('invoices')) {
+          const inv = database.createObjectStore('invoices', { keyPath: 'id' });
+          inv.createIndex('invNo', 'invNo', { unique: false });
+          inv.createIndex('date',  'date',  { unique: false });
+        }
+        if (!database.objectStoreNames.contains('trash')) {
+          database.createObjectStore('trash', { keyPath: 'id' });
+        }
+        if (!database.objectStoreNames.contains('settings')) {
+          database.createObjectStore('settings', { keyPath: 'key' });
+        }
+        if (!database.objectStoreNames.contains('backups')) {
+          const bk = database.createObjectStore('backups', { keyPath: 'id', autoIncrement: true });
+          bk.createIndex('createdAt', 'createdAt', { unique: false });
+        }
+      };
+      req.onsuccess = function(e) {
+        clearTimeout(timer);
+        db = e.target.result;
+        db.onerror = ev => console.error('DB Error:', ev.target.error);
+        useLS = false;
+        resolve();
+      };
+      req.onerror = function(e) {
+        clearTimeout(timer);
+        console.warn('IndexedDB error — switching to localStorage:', e.target.error);
+        useLS = true; resolve();
+      };
+      req.onblocked = function() {
+        clearTimeout(timer);
+        console.warn('IndexedDB blocked — switching to localStorage');
+        useLS = true; resolve();
+      };
+    } catch(e) {
+      console.warn('IndexedDB not available — using localStorage:', e);
+      useLS = true; resolve();
+    }
+  });
+}
+
+// ── GENERIC HELPERS ──
+function dbGetAll(storeName) {
+  if (useLS) {
+    return Promise.resolve(LS.get('aaf_' + storeName) || []);
+  }
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror   = () => { useLS = true; resolve(LS.get('aaf_' + storeName) || []); };
+  });
+}
+function dbPut(storeName, record) {
+  if (useLS) {
+    const key = 'aaf_' + storeName;
+    let arr = LS.get(key) || [];
+    const idx = arr.findIndex(r => r.id === record.id || r.key === record.key);
+    if (idx >= 0) arr[idx] = record; else arr.push(record);
+    LS.set(key, arr);
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(storeName, 'readwrite');
+    const req = tx.objectStore(storeName).put(record);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+function dbDelete(storeName, key) {
+  if (useLS) {
+    const lsKey = 'aaf_' + storeName;
+    let arr = LS.get(lsKey) || [];
+    LS.set(lsKey, arr.filter(r => r.id !== key && r.key !== key));
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(storeName, 'readwrite');
+    const req = tx.objectStore(storeName).delete(key);
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+function dbClear(storeName) {
+  if (useLS) { LS.set('aaf_' + storeName, []); return Promise.resolve(); }
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(storeName, 'readwrite');
+    const req = tx.objectStore(storeName).clear();
+    req.onsuccess = () => resolve();
+    req.onerror   = () => reject(req.error);
+  });
+}
+function dbGet(storeName, key) {
+  if (useLS) {
+    const arr = LS.get('aaf_' + storeName) || [];
+    return Promise.resolve(arr.find(r => r.id === key || r.key === key) || null);
+  }
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror   = () => reject(req.error);
+  });
+}
+function dbBulkPut(storeName, records) {
+  if (useLS) {
+    const lsKey = 'aaf_' + storeName;
+    let arr = LS.get(lsKey) || [];
+    records.forEach(r => {
+      const idx = arr.findIndex(x => x.id === r.id || x.key === r.key);
+      if (idx >= 0) arr[idx] = r; else arr.push(r);
+    });
+    LS.set(lsKey, arr);
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const tx    = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    records.forEach(r => store.put(r));
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+// ── SETTINGS ──
+async function getSetting(key, defaultVal = null) {
+  try { const r = await dbGet('settings', key); return r ? r.value : defaultVal; }
+  catch { return defaultVal; }
+}
+async function setSetting(key, value) {
+  await dbPut('settings', { key, value });
+}
+
+// ── SAVE / LOAD ──
+async function saveData() {
+  await dbBulkPut('invoices', invoices);
+  updateBackupStatus();
+  scheduleAutoBackup();
+  await triggerLocalAutoBackup();
+  if(typeof wsFbPush==='function') wsFbPush(); // ☁️ Firebase sync
+}
+async function saveTrash() {
+  await dbClear('trash');
+  if (trashItems.length) await dbBulkPut('trash', trashItems);
+  updateTrashBadge();
+  if(typeof wsFbPush==='function') wsFbPush(); // ☁️ Firebase sync
+}
+
+async function loadData() {
+  // 1. Migrate old localStorage data first
+  await migrateFromLocalStorage();
+
+  // 2. Load invoices from IndexedDB
+  invoices = await dbGetAll('invoices');
+
+  // 3. Force reseed if seed version is old or empty
+  const seedVer = await getSetting('seedVersion', 0);
+  const wasReset = await getSetting('wasReset', false);
+  if (seedVer < 2 && !wasReset) {
+    invoices = [...SEED_DATA];
+    await dbClear('invoices');
+    await dbBulkPut('invoices', invoices);
+    await setSetting('seedVersion', 2);
+  } else if (!invoices.length && !wasReset) {
+    invoices = [...SEED_DATA];
+    await dbBulkPut('invoices', invoices);
+    await setSetting('seedVersion', 2);
+  }
+
+  // 4. Load trash + expire old items
+  trashItems = await dbGetAll('trash');
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const before = trashItems.length;
+  trashItems = trashItems.filter(i => i.deletedAt > cutoff);
+  if (trashItems.length !== before) await saveTrash();
+
+  // 5. Sort invoices newest first
+  invoices.sort((a, b) => {
+    const na = parseInt(a.invNo.replace('AAF-',''))||0;
+    const nb = parseInt(b.invNo.replace('AAF-',''))||0;
+    return nb - na;
+  });
+}
+
+// ── MIGRATION from localStorage ──
+async function migrateFromLocalStorage() {
+  const migrated = await getSetting('lsMigrated', false);
+  if (migrated) return;
+
+  const raw  = localStorage.getItem('aafInvoices');
+  const rawT = localStorage.getItem('aafTrash');
+
+  if (raw) {
+    try {
+      const data = JSON.parse(raw);
+      if (Array.isArray(data) && data.length) {
+        await dbBulkPut('invoices', data);
+        localStorage.removeItem('aafInvoices');
+        toast('✅ ' + data.length + ' invoices localStorage se IndexedDB mein migrate ho gaye!');
+      }
+    } catch(e) { console.warn('Migration error (invoices):', e); }
+  }
+  if (rawT) {
+    try {
+      const tdata = JSON.parse(rawT);
+      if (Array.isArray(tdata) && tdata.length) {
+        await dbBulkPut('trash', tdata);
+        localStorage.removeItem('aafTrash');
+      }
+    } catch(e) { console.warn('Migration error (trash):', e); }
+  }
+  // Dark mode setting migrate
+  const dark = localStorage.getItem('aafDark');
+  if (dark !== null) { await setSetting('darkMode', dark); localStorage.removeItem('aafDark'); }
+
+  await setSetting('lsMigrated', true);
+}
+
+// ── AUTO BACKUP every 10 mins ──
+let autoBackupTimer = null;
+function scheduleAutoBackup() {
+  clearTimeout(autoBackupTimer);
+  autoBackupTimer = setTimeout(async () => {
+    if (!invoices.length) return;
+    await dbPut('backups', {
+      createdAt: Date.now(),
+      count: invoices.length,
+      data: JSON.stringify(invoices)
+    });
+    // Keep only last 10 backups
+    const all = await dbGetAll('backups');
+    if (all.length > 10) {
+      all.sort((a,b) => a.createdAt - b.createdAt);
+      for (let i = 0; i < all.length - 10; i++) await dbDelete('backups', all[i].id);
+    }
+    if (typeof loadBackupHistory === 'function') loadBackupHistory();
+  }, 10 * 60 * 1000);
+}
+
+// ════════════ NEXT INV NO ════════════
+// ════════════ SETTINGS SYSTEM ════════════
+const TRANSLATIONS = {
+  en: {
+    navNewInvoice: "🧾 New Invoice",
+    navDashboard: "📊 Dashboard",
+    navDatabase: "🗄️ Database",
+    navReports: "📈 Reports",
+    navSettings: "⚙️ Settings",
+    navTrash: "🗑️ Trash",
+    statInvoices: "Invoices",
+    statAmount: "Total Amount",
+    statWeight: "Total Net Wt",
+    mobileTitle: "🌿 Ahsin Agri Farm",
+    backupLabel: "💾 Backup:",
+    btnDownloadJson: "⬇️ JSON",
+    btnExportExcel: "📊 Excel",
+    btnRestoreLocal: "📂 Restore",
+    btnMergeLocal: "🔀 Merge",
+    btnResetData: "🗑️ Reset",
+    invoiceTitle: "🧾 Create New Invoice",
+    lblBuyerName: "Buyer Name",
+    lblDate: "Date",
+    lblDescription: "Description",
+    lblQuantity: "Quantity (Baskets/Boxes)",
+    lblTotalWeight: "Total Weight (KG)",
+    lblTareWeight: "Tare Weight (KG)",
+    lblWastage: "Wastage Percentage (%)",
+    lblRate: "Rate (Rs/KG)",
+    lblAmount: "Total Amount (Rs)",
+    lblStatus: "Payment Status",
+    lblNotes: "Notes (Optional)",
+    btnPreviewInvoice: "👁️ Preview",
+    btnSaveInvoice: "💾 Save Invoice",
+    btnClearForm: "🧹 Clear Form",
+    dashTitle: "📊 Business Overview Dashboard",
+    dashTotalInvoices: "Total Invoices",
+    dashTotalRevenue: "Total Revenue",
+    dashTotalWeight: "Total Weight",
+    dashChartTitle: "📊 Monthly Revenue Chart",
+    dbTitle: "🗄️ Invoices Database",
+    thInvoice: "Invoice#",
+    thDate: "Date",
+    thDescription: "Description",
+    thQty: "Qty",
+    thTotalWt: "Total Wt (KG)",
+    thTareWt: "Tare Wt (KG)",
+    thNeatWt: "Neat Wt (KG)",
+    thWastage: "Wastage (KG)",
+    thNetAfter: "Net After Wastage (KG)",
+    thRate: "Rate (Rs)",
+    thAmount: "Amount (Rs)",
+    thBuyer: "Buyer",
+    thStatus: "Status",
+    thActions: "Actions",
+    settingsTitle: "⚙️ System Default Settings",
+    basketTitle: "🧺 Ice Burg Basket Defaults",
+    cartonTitle: "📦 Ice Burg Box/Carton Defaults",
+    lblDefRate: "Default Rate (Rs/KG)",
+    lblDefTare: "Default Tare Wt (KG)",
+    lblDefWaste: "Default Wastage %",
+    btnSaveSettings: "💾 Save Settings",
+    reportsTitle: "📈 Reports & Analytics",
+    lblFromDate: "From Date",
+    lblToDate: "To Date",
+    lblFilterPerson: "Filter by Person",
+    btnGenReport: "📊 Generate Report",
+    reportSummaryTitle: "📋 Report Summary",
+    reportDetailTitle: "📄 Report Detail",
+    btnPrintReport: "🖨️ Print Report",
+    btnReportPDF: "📄 PDF",
+    btnReportExcel: "📊 Excel",
+    btnReportCSV: "⬇️ CSV",
+    trashTitle: "🗑️ Trash Database (Deleted Invoices)",
+    backupHistoryTitle: "🗂️ In-Browser Backup History (Last 10 Checkpoints)",
+    backupHistoryDesc: "Aap yahan manually checkpoint bana sakte hain, ya pichle automatic backups me se kisi bhi version ko 1-second mein restore kar sakte hain.",
+    btnCreateCheckpoint: "➕ Create Checkpoint",
+    langToggle: "🇵🇰 Urdu"
+  },
+  ur: {
+    navNewInvoice: "🧾 نیا انوائس",
+    navDashboard: "📊 ڈیش بورڈ",
+    navDatabase: "🗄️ ڈیٹا بیس",
+    navReports: "📈 رپورٹیں",
+    navSettings: "⚙️ سیٹنگز",
+    navTrash: "🗑️ ٹریش",
+    statInvoices: "کل انوائسز",
+    statAmount: "کل رقم",
+    statWeight: "کل صاف وزن",
+    mobileTitle: "🌿 احسن ایگری فارم",
+    backupLabel: "💾 بیک اپ:",
+    btnDownloadJson: "⬇️ ڈاؤن لوڈ JSON",
+    btnExportExcel: "📊 ایکسل شیٹ",
+    btnRestoreLocal: "📂 ری ستور",
+    btnMergeLocal: "🔀 مرج کریں",
+    btnResetData: "🗑️ ری سیٹ",
+    invoiceTitle: "🧾 نیا انوائس بنائیں",
+    lblBuyerName: "خریدار کا نام",
+    lblDate: "تاریخ",
+    lblDescription: "تفصیل (فصل)",
+    lblQuantity: "مقدار (ٹوکری/کارٹن)",
+    lblTotalWeight: "کل وزن (کلو)",
+    lblTareWeight: "خالی کا وزن (کلو)",
+    lblWastage: "کاٹ/رعایت فیصد (%)",
+    lblRate: "ریٹ (روپے/کلو)",
+    lblAmount: "کل رقم (روپے)",
+    lblStatus: "ادائیگی کی حالت",
+    lblNotes: "نوٹ (اختیاری)",
+    btnPreviewInvoice: "👁️ پیش نظارہ",
+    btnSaveInvoice: "💾 انوائس محفوظ کریں",
+    btnClearForm: "🧹 فارم صاف کریں",
+    dashTitle: "📊 کاروبار کا جائزہ ڈیش بورڈ",
+    dashTotalInvoices: "کل انوائسز",
+    dashTotalRevenue: "کل آمدنی",
+    dashTotalWeight: "کل وزن",
+    dashChartTitle: "📊 ماہانہ آمدنی کا خلاصہ",
+    dbTitle: "🗄️ انوائسز ڈیٹا بیس",
+    thInvoice: "انوائس نمبر",
+    thDate: "تاریخ",
+    thDescription: "تفصیل",
+    thQty: "مقدار",
+    thTotalWt: "کل وزن",
+    thTareWt: "خالی وزن",
+    thNeatWt: "صافی وزن",
+    thWastage: "کاٹ وزن",
+    thNetAfter: "خالص وزن",
+    thRate: "ریٹ",
+    thAmount: "کل رقم",
+    thBuyer: "خریدار",
+    thStatus: "ادائیگی کی حالت",
+    thActions: "کارروائی",
+    settingsTitle: "⚙️ سسٹم ڈیفالٹ سیٹنگز",
+    basketTitle: "🧺 آئس برگ ٹوکری ڈیفالٹس",
+    cartonTitle: "📦 آئس برگ باکس/کارٹن ڈیفالٹس",
+    lblDefRate: "ڈیفالٹ ریٹ (روپے)",
+    lblDefTare: "ڈیفالٹ خالی وزن (کلو)",
+    lblDefWaste: "ڈیفالٹ کاٹ فیصد (%)",
+    btnSaveSettings: "💾 سیٹنگز محفوظ کریں",
+    reportsTitle: "📈 انوائسز رپورٹیں",
+    lblFromDate: "تاریخ سے",
+    lblToDate: "تاریخ تک",
+    lblFilterPerson: "خریدار سے فلٹر",
+    btnGenReport: "📊 رپورٹ بنائیں",
+    reportSummaryTitle: "📋 رپورٹ کا خلاصہ",
+    reportDetailTitle: "📄 رپورٹ کی تفصیل",
+    btnPrintReport: "🖨️ پرنٹ رپورٹ",
+    btnReportPDF: "📄 پی ڈی ایف",
+    btnReportExcel: "📊 ایکسل",
+    btnReportCSV: "⬇️ سی ایس وی",
+    trashTitle: "🗑️ ٹریش ڈیٹا بیس (حذف شدہ انوائسز)",
+    backupHistoryTitle: "🗂️ براؤزر بیک اپ ہسٹری (آخری 10 ورژن)",
+    backupHistoryDesc: "آپ یہاں دستی طور پر نیا بیک اپ بنا سکتے ہیں یا براؤزر میں موجود آخری 10 ورژنز میں سے کسی کو بھی بحال کر سکتے ہیں۔",
+    btnCreateCheckpoint: "➕ نیا چیک پوائنٹ بنائیں",
+    langToggle: "🇬🇧 English"
+  }
+};
+
+let currentLang = 'en';
+
+async function initLanguage() {
+  const lang = await getSetting('appLanguage', 'en');
+  await setLanguage(lang);
+}
+
+async function setLanguage(lang) {
+  currentLang = lang;
+  await setSetting('appLanguage', lang);
+  
+  // Apply translations to all data-translate elements
+  document.querySelectorAll('[data-translate]').forEach(el => {
+    const key = el.getAttribute('data-translate');
+    if (TRANSLATIONS[lang] && TRANSLATIONS[lang][key] !== undefined) {
+      el.textContent = TRANSLATIONS[lang][key];
+    }
+  });
+  
+  // Set Nastaliq Font
+  if (lang === 'ur') {
+    document.body.classList.add('lang-ur');
+  } else {
+    document.body.classList.remove('lang-ur');
+  }
+  
+  // Update translation button label
+  const btn = document.getElementById('langToggleBtn');
+  if (btn) {
+    btn.textContent = TRANSLATIONS[lang]['langToggle'];
+  }
+}
+
+async function toggleLanguage() {
+  const nextLang = currentLang === 'en' ? 'ur' : 'en';
+  await setLanguage(nextLang);
+  toast('Language changed to: ' + (nextLang === 'ur' ? 'اردو' : 'English'));
+}
+
+// ── BROWSER BACKUPS HISTORY LOG LOGIC ──
+async function loadBackupHistory() {
+  const container = document.getElementById('backupHistoryList');
+  if (!container) return;
+  
+  try {
+    const all = await dbGetAll('backups');
+    // Sort descending (latest backup first)
+    all.sort((a, b) => b.createdAt - a.createdAt);
+    
+    if (all.length === 0) {
+      container.innerHTML = `<span style="font-size: 0.85rem; color: var(--gray); font-style: italic;">No backups found in browser database.</span>`;
+      return;
+    }
+    
+    let html = '';
+    all.forEach(bk => {
+      const dateStr = new Date(bk.createdAt).toLocaleString('en-PK', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+      html += `
+        <div style="display: flex; justify-content: space-between; align-items: center; background: var(--white); padding: 10px 15px; border-radius: 8px; border: 1px solid var(--gray-light); box-shadow: 0 2px 4px rgba(0,0,0,0.02); flex-wrap: wrap; gap: 10px;">
+          <div>
+            <strong style="color: var(--green); font-size: 0.85rem;">📅 ${dateStr}</strong>
+            <span style="font-size: 0.75rem; color: var(--gray); margin-left: 10px;">(${bk.count} Invoices)</span>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-green btn-xs" onclick="restoreBrowserBackup(${bk.id})" style="padding: 4px 8px; font-size: 0.75rem;">🔄 Restore</button>
+            <button class="btn btn-red btn-xs" onclick="deleteBrowserBackup(${bk.id})" style="padding: 4px 8px; font-size: 0.75rem; background: var(--red); color: #fff;">🗑️ Delete</button>
+          </div>
+        </div>
+      `;
+    });
+    container.innerHTML = html;
+  } catch (err) {
+    container.innerHTML = `<span style="color: var(--red); font-size: 0.8rem;">Error loading backups: ${err.message}</span>`;
+  }
+}
+
+async function createManualCheckpoint() {
+  if (!invoices.length) {
+    toast('❌ Backup ke liye data hona zaroori hai!', 'error');
+    return;
+  }
+  try {
+    await dbPut('backups', {
+      createdAt: Date.now(),
+      count: invoices.length,
+      data: JSON.stringify(invoices)
+    });
+    // Keep only last 10
+    const all = await dbGetAll('backups');
+    all.sort((a, b) => a.createdAt - b.createdAt);
+    for (let i = 0; i < all.length - 10; i++) {
+      await dbDelete('backups', all[i].id);
+    }
+    await loadBackupHistory();
+    toast('✅ Checkpoint created successfully!');
+  } catch (err) {
+    toast('❌ Checkpoint failed: ' + err.message, 'error');
+  }
+}
+
+async function restoreBrowserBackup(id) {
+  try {
+    const all = await dbGetAll('backups');
+    const bk = all.find(item => item.id === id);
+    if (!bk) throw new Error('Backup not found');
+    
+    const dateStr = new Date(bk.createdAt).toLocaleString('en-PK');
+    if (!confirm(`Warning: Ye aapke majooda data ko ${dateStr} ke backup (${bk.count} invoices) se badal dega. Continue?`)) {
+      return;
+    }
+    
+    const imported = JSON.parse(bk.data);
+    if (!Array.isArray(imported)) throw new Error('Invalid backup format');
+    
+    invoices = imported;
+    await dbClear('invoices');
+    await dbBulkPut('invoices', invoices);
+    await setSetting('wasReset', false);
+    renderAll();
+    
+    updateBackupStatus();
+    toast('✅ Backup restored successfully!');
+  } catch (err) {
+    toast('❌ Restore failed: ' + err.message, 'error');
+  }
+}
+
+async function deleteBrowserBackup(id) {
+  if (!confirm('Are you sure you want to delete this backup checkpoint?')) return;
+  try {
+    await dbDelete('backups', id);
+    await loadBackupHistory();
+    toast('✅ Checkpoint deleted!');
+  } catch (err) {
+    toast('❌ Delete failed: ' + err.message, 'error');
+  }
+}
+
+let localBackupHandle = null;
+let localBackupPath = null;
+
+async function setupLocalBackup() {
+  if (window.electronAPI && window.electronAPI.isElectron) {
+    try {
+      const filePath = await window.electronAPI.selectSavePath('WaseemSarfaraz_AutoBackup.json');
+      if (filePath) {
+        localBackupPath = filePath;
+        await setSetting('localBackupPath', filePath);
+        await triggerLocalAutoBackup();
+        await initLocalBackup();
+        toast('✅ Desktop Backup path set successfully!');
+      }
+    } catch (err) {
+      toast('❌ Setup failed: ' + err.message, 'error');
+    }
+    return;
+  }
+
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: 'WaseemSarfaraz_AutoBackup.json',
+      types: [{
+        description: 'JSON Backup Files',
+        accept: { 'application/json': ['.json'] }
+      }]
+    });
+    
+    localBackupHandle = handle;
+    await setSetting('localBackupHandle', handle);
+    
+    // Write current data immediately as initial backup
+    await triggerLocalAutoBackup();
+    updateLocalBackupUI(true);
+    toast('✅ Auto-backup file set successfully!');
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      toast('❌ Backup set failed: ' + err.message, 'error');
+    }
+  }
+}
+
+async function grantBackupPermission() {
+  if (!localBackupHandle) return;
+  try {
+    const options = { mode: 'readwrite' };
+    const permission = await localBackupHandle.requestPermission(options);
+    if (permission === 'granted') {
+      updateLocalBackupUI(true);
+      await triggerLocalAutoBackup();
+      toast('✅ Auto-backup permission granted!');
+    } else {
+      toast('⚠️ Permission denied!', 'error');
+    }
+  } catch (err) {
+    toast('❌ Error: ' + err.message, 'error');
+  }
+}
+
+async function initLocalBackup() {
+  if (window.electronAPI && window.electronAPI.isElectron) {
+    localBackupPath = await getSetting('localBackupPath');
+    const statusEl = document.getElementById('localBackupStatus');
+    const grantBtn = document.getElementById('btnGrantBackup');
+    const selectBtn = document.querySelector('button[onclick="setupLocalBackup()"]');
+    
+    if (selectBtn) selectBtn.textContent = '📁 Select Desktop Backup File';
+    if (grantBtn) grantBtn.style.display = 'none';
+    
+    if (localBackupPath) {
+      statusEl.textContent = '✅ Auto-Backup Active: ' + localBackupPath;
+      statusEl.style.color = 'var(--green-light)';
+    } else {
+      statusEl.textContent = 'Auto-Backup: Not Configured';
+      statusEl.style.color = 'var(--gray)';
+    }
+    return;
+  }
+
+  localBackupHandle = await getSetting('localBackupHandle');
+  if (localBackupHandle) {
+    const options = { mode: 'readwrite' };
+    const perm = await localBackupHandle.queryPermission(options);
+    if (perm === 'granted') {
+      updateLocalBackupUI(true);
+    } else {
+      updateLocalBackupUI(false);
+    }
+  } else {
+    document.getElementById('localBackupStatus').textContent = 'Auto-Backup: Not Configured';
+    document.getElementById('localBackupStatus').style.color = 'var(--gray)';
+    document.getElementById('btnGrantBackup').style.display = 'none';
+  }
+}
+
+function updateLocalBackupUI(active) {
+  const statusEl = document.getElementById('localBackupStatus');
+  const grantBtn = document.getElementById('btnGrantBackup');
+  
+  if (active) {
+    statusEl.textContent = '✅ Auto-Backup Active (Saving silently)';
+    statusEl.style.color = 'var(--green-light)';
+    grantBtn.style.display = 'none';
+  } else {
+    statusEl.textContent = '⚠️ Auto-Backup Paused (Need Permission)';
+    statusEl.style.color = 'var(--gold)';
+    grantBtn.style.display = 'inline-flex';
+  }
+}
+
+async function triggerLocalAutoBackup() {
+  const backupData = JSON.stringify({
+    version: 2,
+    exported: new Date().toISOString(),
+    count: invoices.length,
+    invoices
+  }, null, 2);
+
+  if (window.electronAPI && window.electronAPI.isElectron) {
+    if (!localBackupPath) return;
+    try {
+      const res = await window.electronAPI.saveBackupSilently(backupData, localBackupPath);
+      const statusEl = document.getElementById('localBackupStatus');
+      if (res.success) {
+        if (statusEl) {
+          statusEl.textContent = '✅ Auto-Backup Active: ' + localBackupPath;
+          statusEl.style.color = 'var(--green-light)';
+        }
+      } else {
+        if (statusEl) {
+          statusEl.textContent = '❌ Auto-Backup Failed: ' + res.error;
+          statusEl.style.color = 'var(--red)';
+        }
+      }
+    } catch (err) {
+      console.error('Electron backup failed:', err);
+    }
+    return;
+  }
+
+  if (!localBackupHandle) return;
+  try {
+    const options = { mode: 'readwrite' };
+    if (await localBackupHandle.queryPermission(options) !== 'granted') {
+      updateLocalBackupUI(false);
+      return;
+    }
+    
+    const writable = await localBackupHandle.createWritable();
+    await writable.write(backupData);
+    await writable.close();
+    updateLocalBackupUI(true);
+  } catch (err) {
+    console.error('Local backup write failed:', err);
+    updateLocalBackupUI(false);
+  }
+}
+
+async function loadProductSettings() {
+  const dbDefaults = await getSetting('productDefaults');
+  if (dbDefaults) {
+    Object.assign(PRODUCT_DEFAULTS, dbDefaults);
+  } else {
+    await setSetting('productDefaults', PRODUCT_DEFAULTS);
+  }
+}
+
+function loadSettingsToForm() {
+  const basket = PRODUCT_DEFAULTS['Ice Burg Basket'];
+  const carton = PRODUCT_DEFAULTS['Ice Burg Box/Carton'];
+
+  document.getElementById('setBasketRate').value = basket.rate;
+  document.getElementById('setBasketTare').value = basket.tareWt;
+  document.getElementById('setBasketWaste').value = basket.wastePct;
+
+  document.getElementById('setCartonRate').value = carton.rate;
+  document.getElementById('setCartonTare').value = carton.tareWt;
+  document.getElementById('setCartonWaste').value = carton.wastePct;
+}
+
+async function saveSettings() {
+  const basketRate = parseFloat(document.getElementById('setBasketRate').value) || 0;
+  const basketTare = parseFloat(document.getElementById('setBasketTare').value) || 0;
+  const basketWaste = parseFloat(document.getElementById('setBasketWaste').value) || 0;
+
+  const cartonRate = parseFloat(document.getElementById('setCartonRate').value) || 0;
+  const cartonTare = parseFloat(document.getElementById('setCartonTare').value) || 0;
+  const cartonWaste = parseFloat(document.getElementById('setCartonWaste').value) || 0;
+
+  PRODUCT_DEFAULTS['Ice Burg Basket'] = {
+    rate: basketRate,
+    tareWt: basketTare,
+    wastePct: basketWaste
+  };
+
+  PRODUCT_DEFAULTS['Ice Burg Box/Carton'] = {
+    rate: cartonRate,
+    tareWt: cartonTare,
+    wastePct: cartonWaste
+  };
+
+  await setSetting('productDefaults', PRODUCT_DEFAULTS);
+  showAlert('settingsAlert', '✅ Settings saved successfully!', 'success');
+  toast('✅ Settings saved!');
+  
+  onDescChange();
+}
+
+function toggleMobileMenu() {
+  const sidebar = document.querySelector('.sidebar');
+  if (sidebar) sidebar.classList.toggle('open');
+}
+
+function nextInvNo() {
+  if (!invoices.length) return 'AAF-001';
+  const nums = invoices.map(i => parseInt(i.invNo.replace('AAF-',''))||0);
+  return 'AAF-' + String(Math.max(...nums)+1).padStart(3,'0');
+}
+
+// ════════════ TABS ════════════
+function showTab(id) {
+  document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  
+  const btn = document.querySelector(`nav button[onclick="showTab('${id}')"]`);
+  if (btn) btn.classList.add('active');
+  
+  const sidebar = document.querySelector('.sidebar');
+  if (sidebar) sidebar.classList.remove('open');
+  
+  if (id==='database') { dbPage=1; renderDB(); }
+  if (id==='dashboard') renderDashboard();
+  if (id==='trash') renderTrash();
+  if (id==='pending') renderPending();
+  if (id==='settings') { loadSettingsToForm(); if (typeof loadBackupHistory === 'function') loadBackupHistory(); }
+}
+
+// ════════════ DARK MODE ════════════
+async function initDark() {
+  const dark = await getSetting('darkMode', '0');
+  if (dark === '1') {
+    document.body.classList.add('dark');
+    document.getElementById('darkBtn').textContent='☀️ Light';
+  }
+}
+async function toggleDark() {
+  const d = document.body.classList.toggle('dark');
+  await setSetting('darkMode', d?'1':'0');
+  document.getElementById('darkBtn').textContent = d ? '☀️ Light':'🌙 Dark';
+}
+
+// ════════════ TOAST ════════════
+function toast(msg, type='success') {
+  const c = document.getElementById('toastContainer');
+  const t = document.createElement('div');
+  t.className = `toast ${type==='error'?'error':type==='info'?'info':''}`;
+  t.textContent = msg;
+  c.appendChild(t);
+  setTimeout(()=>{ t.style.opacity='0'; t.style.transition='opacity .3s'; setTimeout(()=>t.remove(),300); }, 3000);
+}
+
+function showAlert(id,msg,type) {
+  const el=document.getElementById(id);
+  el.textContent=msg; el.className=`alert alert-${type}`; el.style.display='block';
+  setTimeout(()=>el.style.display='none',3500);
+}
+function clearErr(el){ el.style.borderColor=''; el.style.boxShadow=''; }
+
+// ════════════ MODAL ════════════
+let pendingDeleteId = null;
+let pendingPermDeleteId = null;
+
+function openModal(id){ document.getElementById(id).classList.add('open'); }
+function closeModal(id){ document.getElementById(id).classList.remove('open'); }
+
+function confirmDelete(id, invNo) {
+  pendingDeleteId = id;
+  document.getElementById('deleteModalMsg').textContent = `Move invoice "${invNo}" to Trash?`;
+  openModal('deleteModal');
+}
+async function confirmDeleteAction() {
+  if (!pendingDeleteId) return;
+  const idx = invoices.findIndex(i=>i.id===pendingDeleteId);
+  if (idx !== -1) {
+    const inv = invoices[idx];
+    trashItems.unshift({...inv, deletedAt:Date.now(), deletedOn: new Date().toLocaleDateString('en-PK')});
+    invoices.splice(idx,1);
+    await dbDelete('invoices', inv.id);
+    await dbPut('trash', trashItems[0]);
+    updateBackupStatus();
+    await saveTrash();
+    renderAll();
+    toast(`🗑️ ${inv.invNo} moved to Trash`);
+  }
+  pendingDeleteId = null;
+  closeModal('deleteModal');
+}
+
+function openPermDelete(id, invNo) {
+  pendingPermDeleteId = id;
+  document.getElementById('permDeleteMsg').textContent = `Permanently delete "${invNo}"? Cannot be undone!`;
+  openModal('permDeleteModal');
+}
+function confirmPermDelete() {
+  if (!pendingPermDeleteId) return;
+  trashItems = trashItems.filter(i=>i.id!==pendingPermDeleteId);
+  saveTrash(); renderTrash();
+  toast('Permanently deleted','error');
+  pendingPermDeleteId = null;
+  closeModal('permDeleteModal');
+}
+
+async function restoreFromTrash(id) {
+  const idx = trashItems.findIndex(i=>i.id===id);
+  if (idx===-1) return;
+  const inv = {...trashItems[idx]};
+  delete inv.deletedAt; delete inv.deletedOn;
+  invoices.unshift(inv);
+  trashItems.splice(idx,1);
+  await saveData(); await saveTrash(); renderTrash(); renderAll();
+  toast(`✅ ${inv.invNo} restored`);
+}
+
+async function emptyTrash() {
+  if (!trashItems.length) { toast('Trash is already empty','info'); return; }
+  if (!confirm(`Permanently delete all ${trashItems.length} items in Trash?`)) return;
+  trashItems=[];
+  await saveTrash(); renderTrash();
+  toast('Trash emptied','error');
+}
+
+function updateTrashBadge() {
+  const btn = document.getElementById('trashNavBtn');
+  const existing = btn.querySelector('.trash-badge');
+  if (existing) existing.remove();
+  if (trashItems.length) {
+    const b = document.createElement('span');
+    b.className='trash-badge'; b.textContent=trashItems.length;
+    btn.appendChild(b);
+  }
+}
+
+// ════════════ RENDER TRASH ════════════
+function renderTrash() {
+  const body = document.getElementById('trashBody');
+  if (!trashItems.length) {
+    body.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--gray);padding:24px;">Trash is empty 🗑️</td></tr>';
+    return;
+  }
+  body.innerHTML = trashItems.map(i=>`
+    <tr>
+      <td><b>${i.invNo}</b></td><td>${i.date}</td><td>${i.desc}</td>
+      <td><b>Rs ${parseFloat(i.amount).toLocaleString()}</b></td>
+      <td>${i.person}</td><td>${i.deletedOn||'—'}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-green btn-sm" onclick="restoreFromTrash(${i.id})">↩️ Restore</button>
+        <button class="btn btn-red btn-sm" onclick="openPermDelete(${i.id},'${i.invNo}')">🗑️ Delete Forever</button>
+      </td>
+    </tr>`).join('');
+}
+
+// ════════════ DESC CHANGE ════════════
+function onDescChange() {
+  const desc = document.getElementById('invDesc').value;
+  const def  = PRODUCT_DEFAULTS[desc]||PRODUCT_DEFAULTS['Ice Burg Basket'];
+  document.getElementById('invTareWt').value = def.tareWt;
+  document.getElementById('invRate').value   = def.rate;
+  document.getElementById('invWastePct').value = def.wastePct;
+  const lbl = document.getElementById('tareLabel');
+  if(lbl) lbl.innerHTML = `${desc==='Ice Burg Box/Carton'?'Box/Carton':'Basket'} Tare Wt (KG) <span style="color:var(--gold);font-size:.72rem;">default ${def.tareWt} KG</span>`;
+  autoCalcNeatWt();
+}
+
+// ════════════ CALCULATIONS ════════════
+function autoCalcNeatWt() {
+  const totalWt = parseFloat(document.getElementById('invTotalWt').value)||0;
+  const qty     = parseFloat(document.getElementById('invQty').value)||0;
+  const tareWt  = parseFloat(document.getElementById('invTareWt').value)||1.5;
+  if (totalWt>0 && qty>0) {
+    const neatWt = Math.max(0, totalWt-(qty*tareWt));
+    document.getElementById('invNeatWt').value = neatWt.toFixed(2);
+  }
+  calcWaste();
+}
+function calcWaste() {
+  const nw       = parseFloat(document.getElementById('invNeatWt').value)||0;
+  const wastePct = parseFloat(document.getElementById('invWastePct').value)||0;
+  const wasteKg  = nw*(wastePct/100);
+  const neatAfter= Math.max(0,nw-wasteKg);
+  document.getElementById('invWaste').value     = wasteKg.toFixed(2);
+  document.getElementById('invNeatAfter').value = neatAfter.toFixed(2);
+  calcAmount();
+}
+function calcAmount() {
+  const na   = parseFloat(document.getElementById('invNeatAfter').value)||0;
+  const rate = parseFloat(document.getElementById('invRate').value)||0;
+  document.getElementById('invAmount').value = (na*rate).toFixed(2);
+}
+
+// ════════════ SAVE INVOICE ════════════
+async function saveInvoice() {
+  const date      = document.getElementById('invDate').value;
+  const descSel   = document.getElementById('invDesc').value;
+  const descCustom= document.getElementById('invDescCustom').value.trim();
+  const desc      = descSel==='Other'?(descCustom||'Other'):descSel;
+  const qty       = document.getElementById('invQty').value.trim();
+  const totalWt   = parseFloat(document.getElementById('invTotalWt').value)||0;
+  const tareWt    = parseFloat(document.getElementById('invTareWt').value)||1.5;
+  const neatWt    = parseFloat(document.getElementById('invNeatWt').value)||0;
+  const wastePct  = parseFloat(document.getElementById('invWastePct').value)||15;
+  const waste     = parseFloat(document.getElementById('invWaste').value)||0;
+  const neatAfter = parseFloat(document.getElementById('invNeatAfter').value)||0;
+  const rate      = parseFloat(document.getElementById('invRate').value)||0;
+  const amount    = parseFloat(document.getElementById('invAmount').value)||0;
+  const person    = document.getElementById('invPerson').value.trim();
+  const notes     = document.getElementById('invNotes').value.trim();
+
+  // Validation
+  let ok=true;
+  [{id:'invDate',lbl:'Date'},{id:'invNeatWt',lbl:'Neat Weight'},{id:'invRate',lbl:'Rate'},{id:'invPerson',lbl:'Person'}].forEach(f=>{
+    const el=document.getElementById(f.id);
+    if(!el.value){ el.style.borderColor='#c0392b'; el.style.boxShadow='0 0 0 3px rgba(192,57,43,.15)'; ok=false; }
+    else{ el.style.borderColor=''; el.style.boxShadow=''; }
+  });
+  if(!ok){ showAlert('invAlert','⚠️ Please fill all required fields','error'); return; }
+
+  if (editingId) {
+    const idx=invoices.findIndex(r=>r.id===editingId);
+    if(idx!==-1) {
+      invoices[idx]={id:editingId,invNo:invoices[idx].invNo,date,desc,descCustom,qty,totalWt,tareWt,neatWt,wastePct,waste,neatAfter,rate,amount,person,status:'Paid',notes};
+      await dbPut('invoices', invoices[idx]);
+    }
+    editingId=null;
+    const saveBtn=document.querySelector('[onclick="saveInvoice()"]');
+    if(saveBtn){saveBtn.textContent='💾 Save Invoice';saveBtn.style.background='';}
+    updateBackupStatus(); autoGdriveBackup(); updatePersonLists(); updateMonthFilter();
+    showAlert('invAlert','✅ Invoice updated!','success');
+    toast('✅ Invoice updated!');
+    clearForm(); renderDashboard(); renderDB();
+  } else {
+    const rec={id:Date.now(),invNo:nextInvNo(),date,desc,descCustom,qty,totalWt,tareWt,neatWt,wastePct,waste,neatAfter,rate,amount,person,status:'Paid',notes};
+    invoices.unshift(rec);
+    await dbPut('invoices', rec);
+    await setSetting('wasReset', false);
+    updateBackupStatus(); autoGdriveBackup(); updatePersonLists(); updateMonthFilter();
+    showAlert('invAlert',`✅ Invoice ${rec.invNo} saved!`,'success');
+    toast(`✅ Invoice ${rec.invNo} saved!`);
+    clearForm(); renderDashboard();
+  }
+}
+
+function clearForm() {
+  editingId=null;
+  const saveBtn=document.querySelector('[onclick="saveInvoice()"]');
+  if(saveBtn){saveBtn.textContent='💾 Save Invoice';saveBtn.style.background='';}
+  ['invQty','invTotalWt','invNeatWt','invWaste','invNeatAfter','invAmount','invNotes'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.value='';
+  });
+  autoFillFromLastInvoice();
+  document.getElementById('invNo').value=nextInvNo();
+}
+
+// ════════════ AUTO-FILL ════════════
+function autoFillFromLastInvoice() {
+  if(!invoices.length){
+    document.getElementById('invDate').value=new Date().toISOString().split('T')[0];
+    document.getElementById('invWastePct').value='15';
+    document.getElementById('invTareWt').value='1.5';
+    document.getElementById('invRate').value='90';
+    document.getElementById('invDesc').value='Ice Burg Basket';
+    document.getElementById('invPerson').value='Sarfaraz Abbasi';
+    document.getElementById('invDescCustom').value='Sarfaraz Abbasi';
+    return;
+  }
+  const sorted=[...invoices].sort((a,b)=>b.date.localeCompare(a.date));
+  const last=sorted[0];
+  // desc first (so tare/rate update happens before we overwrite)
+  const descEl=document.getElementById('invDesc');
+  if(descEl&&last.desc) descEl.value=last.desc;
+  // Next date
+  const nd=new Date(last.date); nd.setDate(nd.getDate()+1);
+  document.getElementById('invDate').value=nd.toISOString().split('T')[0];
+  document.getElementById('invPerson').value=last.person||'Sarfaraz Abbasi';
+  document.getElementById('invDescCustom').value=last.person||'Sarfaraz Abbasi';
+  document.getElementById('invWastePct').value=last.wastePct||15;
+  document.getElementById('invRate').value=last.rate||90;
+  document.getElementById('invTareWt').value=last.tareWt||1.5;
+  // update tare label
+  onDescChange();
+  // restore rate (onDescChange may overwrite)
+  document.getElementById('invRate').value=last.rate||90;
+}
+
+// ════════════ PREVIEW ════════════
+function generatePreview(invObj) {
+  const i = invObj || {
+    invNo: document.getElementById('invNo').value||nextInvNo(),
+    date:  document.getElementById('invDate').value||'—',
+    desc:  document.getElementById('invDesc').value,
+    qty:   document.getElementById('invQty').value||'—',
+    totalWt: document.getElementById('invTotalWt').value||'0',
+    neatWt:  document.getElementById('invNeatWt').value||'0',
+    waste:   document.getElementById('invWaste').value||'0',
+    wastePct: document.getElementById('invWastePct').value||'15',
+    neatAfter: document.getElementById('invNeatAfter').value||'0',
+    rate:    document.getElementById('invRate').value||'0',
+    amount:  document.getElementById('invAmount').value||'0',
+    person:  document.getElementById('invPerson').value||'—',
+  };
+
+  document.getElementById('pInvNo').textContent=i.invNo;
+  document.getElementById('pInvDate').textContent=i.date;
+  document.getElementById('pPerson').textContent=i.person;
+  const now=new Date();
+  document.getElementById('pPrintDate').textContent=now.toLocaleDateString('en-PK');
+  document.getElementById('pPrintTime').textContent=now.toLocaleTimeString('en-PK');
+
+  document.getElementById('pTableBody').innerHTML=`<tr>
+    <td>${i.desc}</td><td>${i.qty}</td><td>${i.totalWt} KG</td>
+    <td>${i.neatWt} KG</td><td>${i.waste} KG (${i.wastePct}%)</td><td>${i.neatAfter} KG</td>
+    <td>Rs ${parseFloat(i.rate).toLocaleString()}</td>
+    <td><b>Rs ${parseFloat(i.amount).toLocaleString()}</b></td>
+  </tr>`;
+  document.getElementById('pNeatAfter').textContent=i.neatAfter+' KG';
+  document.getElementById('pRate').textContent='Rs '+parseFloat(i.rate).toLocaleString();
+  document.getElementById('pTotal').textContent='Rs '+parseFloat(i.amount).toLocaleString();
+
+  // QR Code
+  const qrDiv=document.getElementById('qrCode');
+  qrDiv.innerHTML='';
+  try {
+    new QRCode(qrDiv,{
+      text:`AAF Invoice\nNo:${i.invNo}\nDate:${i.date}\nAmt:Rs${i.amount}\nPerson:${i.person}`,
+      width:80,height:80,colorDark:'#1a5c2a',colorLight:'#fff'
+    });
+  } catch(e){}
+
+  // Barcode
+  try {
+    JsBarcode('#barcodeEl', i.invNo.replace('AAF-','AAF'), {
+      format:'CODE128',width:1.5,height:35,displayValue:true,
+      text:i.invNo,fontSize:10,background:'transparent',lineColor:'#1a5c2a'
+    });
+  } catch(e){}
+
+  const preview=document.getElementById('invoicePreview');
+  preview.style.display='block';
+  setTimeout(()=>preview.scrollIntoView({behavior:'smooth'}),100);
+}
+
+function viewInvPreview(id) {
+  const i=invoices.find(r=>r.id===id);
+  if(!i) return;
+  showTab('invoice');
+  generatePreview(i);
+}
+
+// ════════════ EDIT ════════════
+function editInvoice(id) {
+  const i=invoices.find(r=>r.id===id);
+  if(!i) return;
+  editingId=id;
+  showTab('invoice');
+  document.getElementById('invNo').value      =i.invNo;
+  document.getElementById('invDate').value    =i.date;
+  document.getElementById('invDesc').value    =i.desc;
+  document.getElementById('invDescCustom').value=i.descCustom||i.person||'Sarfaraz Abbasi';
+  document.getElementById('invQty').value     =i.qty||'';
+  document.getElementById('invTotalWt').value =i.totalWt||'';
+  document.getElementById('invTareWt').value  =i.tareWt||1.5;
+  document.getElementById('invNeatWt').value  =i.neatWt||'';
+  document.getElementById('invWastePct').value=i.wastePct||15;
+  document.getElementById('invWaste').value   =i.waste||'';
+  document.getElementById('invNeatAfter').value=i.neatAfter||'';
+  document.getElementById('invRate').value    =i.rate||90;
+  document.getElementById('invAmount').value  =i.amount||'';
+  document.getElementById('invPerson').value  =i.person||'';
+  document.getElementById('invNotes').value   =i.notes||'';
+  onDescChange();
+  document.getElementById('invRate').value=i.rate;
+  const saveBtn=document.querySelector('[onclick="saveInvoice()"]');
+  if(saveBtn){saveBtn.textContent='💾 Update Invoice';saveBtn.style.background='#c9960a';}
+  window.scrollTo({top:0,behavior:'smooth'});
+  showAlert('invAlert','✏️ Editing: '+i.invNo+' — Make changes and click Update Invoice','success');
+}
+
+// ════════════ DELETE ════════════
+function deleteRec(id) {
+  const inv=invoices.find(i=>i.id===id);
+  confirmDelete(id, inv?inv.invNo:id);
+}
+
+// ════════════ WHATSAPP ════════════
+function shareWhatsApp() {
+  const invNo  =document.getElementById('pInvNo').textContent;
+  const date   =document.getElementById('pInvDate').textContent;
+  const person =document.getElementById('pPerson').textContent;
+  const total  =document.getElementById('pTotal').textContent;
+  const neatAfter=document.getElementById('pNeatAfter').textContent;
+  const msg=`🌿 *Ahsin Agri Farm*\n*Invoice:* ${invNo}\n*Date:* ${date}\n*Received By:* ${person}\n*Net After Wastage:* ${neatAfter}\n*Total Amount:* ${total}\n\n_Generated by AAF Pro System_`;
+  window.open('https://wa.me/?text='+encodeURIComponent(msg),'_blank');
+}
+
+// ════════════ DASHBOARD ════════════
+function getFilteredInvoices() {
+  const today=new Date(); today.setHours(0,0,0,0);
+  const todayStr=today.toISOString().split('T')[0];
+  return invoices.filter(i=>{
+    if(dashFilterMode==='all') return true;
+    const d=new Date(i.date);
+    if(dashFilterMode==='today') return i.date===todayStr;
+    if(dashFilterMode==='week'){const w=new Date(today);w.setDate(w.getDate()-7);return d>=w;}
+    if(dashFilterMode==='month') return i.date.slice(0,7)===todayStr.slice(0,7);
+    if(dashFilterMode==='3months'){const m=new Date(today);m.setMonth(m.getMonth()-3);return d>=m;}
+    if(dashFilterMode==='year') return i.date.slice(0,4)===todayStr.slice(0,4);
+    return true;
+  });
+}
+function setDashFilter(mode) {
+  dashFilterMode=mode;
+  document.querySelectorAll('#dashboard .qf-btn').forEach(b=>{
+    b.classList.toggle('active', b.textContent.toLowerCase().includes(mode)||
+      (mode==='all'&&b.textContent.includes('All'))||(mode==='3months'&&b.textContent.includes('3')));
+  });
+  const labels={today:'📅 Today',week:'📆 This Week',month:'🗓️ This Month','3months':'📊 Last 3 Months',year:'📈 This Year',all:''};
+  document.getElementById('dashFilterLabel').textContent=labels[mode]||'';
+  renderDashboard();
+}
+function renderDashboard() {
+  const today=new Date().toISOString().split('T')[0];
+  const data=getFilteredInvoices();
+  const totalAmt    =data.reduce((s,i)=>s+i.amount,0);
+  const totalNeatWt =data.reduce((s,i)=>s+(parseFloat(i.neatWt)||0),0);
+  const totalTare   =data.reduce((s,i)=>s+((parseFloat(i.qty)||0)*(parseFloat(i.tareWt)||1.5)),0);
+  const totalWaste  =data.reduce((s,i)=>s+(parseFloat(i.waste)||0),0);
+  const totalNetAfter=data.reduce((s,i)=>s+(parseFloat(i.neatAfter)||0),0);
+  const avgRate     =data.length?data.reduce((s,i)=>s+(parseFloat(i.rate)||0),0)/data.length:0;
+  const persons     =new Set(data.map(i=>i.person)).size;
+  const todayInv    =invoices.filter(i=>i.date===today).length;
+  ['dTotalInv','hTotalInv'].forEach(id=>document.getElementById(id).textContent=data.length);
+  ['dTotalAmt','hTotalAmt'].forEach(id=>document.getElementById(id).textContent=totalAmt.toLocaleString());
+  ['dTotalKg','hTotalKg'].forEach(id=>document.getElementById(id).textContent=totalNeatWt.toFixed(0));
+  document.getElementById('dTotalTare').textContent=totalTare.toFixed(0);
+  document.getElementById('dTotalWaste').textContent=totalWaste.toFixed(0);
+  document.getElementById('dNetAfterWaste').textContent=totalNetAfter.toFixed(0);
+  document.getElementById('dNetCalc').textContent=`${totalNetAfter.toFixed(1)} KG × Rs ${avgRate.toFixed(0)} = Rs ${totalAmt.toLocaleString()}`;
+  document.getElementById('dPersons').textContent=persons;
+  document.getElementById('dToday').textContent=todayInv;
+  renderChart();
+  const recent=data.slice(0,10);
+  document.getElementById('recentBody').innerHTML=recent.map(i=>`
+    <tr><td><b>${i.invNo}</b></td><td>${i.date}</td><td>${shortDesc(i.desc)}</td><td>${i.qty||'—'}</td>
+    <td>${i.neatAfter} KG</td><td>Rs ${i.rate}</td>
+    <td><b>Rs ${i.amount.toLocaleString()}</b></td><td>${i.person}</td></tr>`).join('')
+    ||'<tr><td colspan="8" style="text-align:center;color:var(--gray);padding:20px;">No records yet</td></tr>';
+}
+
+// ════════════ CHART ════════════
+function renderChart() {
+  const monthly={};
+  invoices.forEach(i=>{
+    const m=i.date?i.date.slice(0,7):''; if(!m) return;
+    if(!monthly[m]) monthly[m]={amt:0,count:0};
+    monthly[m].amt+=parseFloat(i.amount)||0; monthly[m].count+=1;
+  });
+  const keys=Object.keys(monthly).sort().slice(-8);
+  if(!keys.length){document.getElementById('chartBars').innerHTML='<div style="color:var(--gray);padding:20px;font-size:.82rem;">No data yet</div>';return;}
+  const maxAmt=Math.max(...keys.map(k=>monthly[k].amt));
+  const months=['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  document.getElementById('chartBars').innerHTML=keys.map(k=>{
+    const h=maxAmt?Math.max(12,(monthly[k].amt/maxAmt)*120):12;
+    const mName=months[parseInt(k.slice(5))]||k.slice(5);
+    return `<div class="chart-bar-col">
+      <div class="chart-bar" style="height:${h}px;">
+        <div class="tip">${mName}: Rs ${monthly[k].amt.toLocaleString()} (${monthly[k].count} inv)</div>
+      </div>
+      <div class="chart-label">${mName}</div>
+      <div class="chart-amt">Rs ${(monthly[k].amt/1000).toFixed(0)}K</div>
+    </div>`;
+  }).join('');
+}
+
+// ════════════ DATABASE ════════════
+let searchTimer=null;
+function debouncedSearch(){ clearTimeout(searchTimer); searchTimer=setTimeout(()=>{dbPage=1;renderDB();},280); }
+
+function highlight(text, q) {
+  if (!q) return String(text||'');
+  const s=String(text||'');
+  const idx=s.toLowerCase().indexOf(q.toLowerCase());
+  if(idx===-1) return s;
+  return s.slice(0,idx)+`<span class="hl">${s.slice(idx,idx+q.length)}</span>`+s.slice(idx+q.length);
+}
+
+function renderDB() {
+  const q=(document.getElementById('searchTxt').value||'').toLowerCase().trim();
+  const fm=document.getElementById('filterMonth').value;
+  let data=invoices.filter(i=>{
+    const match=!q||[i.invNo,i.desc,i.person,i.notes,String(i.qty),String(i.amount),String(i.rate),i.date].join(' ').toLowerCase().includes(q);
+    const matchM=!fm||i.date.slice(0,7)===fm;
+    return match&&matchM;
+  });
+  data.sort((a,b)=>{
+    const na=parseInt(a.invNo.replace('AAF-',''))||0;
+    const nb=parseInt(b.invNo.replace('AAF-',''))||0;
+    return nb-na;
+  });
+  currentReport=data;
+  const totalPages=Math.ceil(data.length/PAGE_SIZE)||1;
+  if(dbPage>totalPages) dbPage=totalPages;
+  const start=(dbPage-1)*PAGE_SIZE, end=start+PAGE_SIZE;
+  const pageData=data.slice(start,end);
+
+  document.getElementById('dbBody').innerHTML=pageData.map(i=>`
+    <tr>
+      <td><b>${highlight(i.invNo,q)}</b></td>
+      <td>${highlight(i.date,q)}</td>
+      <td>${highlight(shortDesc(i.desc),q)}</td>
+      <td>${i.qty||'—'}</td>
+      <td>${i.totalWt} KG</td><td>${i.neatWt} KG</td>
+      <td>${i.waste} KG (${i.wastePct||15}%)</td>
+      <td>${i.neatAfter} KG</td>
+      <td>Rs ${i.rate}</td>
+      <td><b>Rs ${i.amount.toLocaleString()}</b></td>
+      <td>${highlight(i.person,q)}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-green btn-sm" onclick="editInvoice(${i.id})" title="Edit">✏️</button>
+        <button class="btn btn-gold btn-sm" onclick="viewInvPreview(${i.id})" title="Preview">👁️</button>
+        <button class="btn btn-red btn-sm" onclick="deleteRec(${i.id})" title="Delete">🗑️</button>
+      </td>
+    </tr>`).join('')||'<tr><td colspan="12" style="text-align:center;color:var(--gray);padding:20px;">No records found</td></tr>';
+
+  const totalAmt=data.reduce((s,i)=>s+i.amount,0);
+  const totalKg=data.reduce((s,i)=>s+i.neatAfter,0);
+  document.getElementById('dbSummary').textContent=
+    `Showing ${data.length} records (page ${dbPage}/${totalPages}) | Total Rs ${totalAmt.toLocaleString()} | Net Wt ${totalKg.toFixed(2)} KG`;
+
+  // Pagination
+  const pg=document.getElementById('dbPagination');
+  pg.innerHTML='';
+  if(totalPages<=1) return;
+  const mkBtn=(lbl,pg_,disabled,active)=>{
+    const b=document.createElement('button');
+    b.className='pg-btn'+(active?' active':'');
+    b.textContent=lbl; b.disabled=disabled;
+    b.onclick=()=>{dbPage=pg_;renderDB();};
+    return b;
+  };
+  pg.appendChild(mkBtn('◀',dbPage-1,dbPage===1,false));
+  const start2=Math.max(1,dbPage-2), end2=Math.min(totalPages,dbPage+2);
+  if(start2>1){ pg.appendChild(mkBtn('1',1,false,false)); if(start2>2){const d=document.createElement('span');d.textContent='…';d.style.padding='0 4px';pg.appendChild(d);} }
+  for(let p=start2;p<=end2;p++) pg.appendChild(mkBtn(p,p,false,p===dbPage));
+  if(end2<totalPages){ if(end2<totalPages-1){const d=document.createElement('span');d.textContent='…';d.style.padding='0 4px';pg.appendChild(d);} pg.appendChild(mkBtn(totalPages,totalPages,false,false)); }
+  pg.appendChild(mkBtn('▶',dbPage+1,dbPage===totalPages,false));
+}
+
+// ════════════ REPORTS ════════════
+function setQuickFilter(mode) {
+  const today=new Date(), todayStr=today.toISOString().split('T')[0];
+  let from='',to=todayStr;
+  if(mode==='today') from=todayStr;
+  else if(mode==='week'){const d=new Date(today);d.setDate(d.getDate()-7);from=d.toISOString().split('T')[0];}
+  else if(mode==='month') from=todayStr.slice(0,7)+'-01';
+  else if(mode==='3months'){const d=new Date(today);d.setMonth(d.getMonth()-3);from=d.toISOString().split('T')[0];}
+  else if(mode==='year') from=todayStr.slice(0,4)+'-01-01';
+  else{from='';to='';}
+  document.getElementById('rptFrom').value=from;
+  document.getElementById('rptTo').value=to;
+  generateReport();
+}
+
+function generateReport() {
+  const from=document.getElementById('rptFrom').value;
+  const to=document.getElementById('rptTo').value;
+  const person=document.getElementById('rptPerson').value.trim().toLowerCase();
+  const packType=document.getElementById('rptPackType').value;
+  let data=invoices.filter(i=>{
+    const inRange=(!from||i.date>=from)&&(!to||i.date<=to);
+    const matchP=!person||i.person.toLowerCase().includes(person);
+    const desc=(i.desc||'').toLowerCase();
+    const matchPack=!packType||(packType==='basket'?desc.includes('basket'):desc.includes('carton')||desc.includes('box'));
+    return inRange&&matchP&&matchPack;
+  });
+  data.sort((a,b)=>{
+    if(a.date!==b.date) return a.date.localeCompare(b.date);
+    const na=parseInt(a.invNo.replace('AAF-',''))||0;
+    const nb=parseInt(b.invNo.replace('AAF-',''))||0;
+    return na-nb;
+  });
+  currentReport=data;
+
+  const totalAmt=data.reduce((s,i)=>s+i.amount,0);
+  const totalNeatWt=data.reduce((s,i)=>s+(parseFloat(i.neatWt)||0),0);
+  const totalWaste=data.reduce((s,i)=>s+(parseFloat(i.waste)||0),0);
+  const totalNetAfter=data.reduce((s,i)=>s+(parseFloat(i.neatAfter)||0),0);
+  const totalTare=data.reduce((s,i)=>s+((parseFloat(i.qty)||0)*(parseFloat(i.tareWt)||1.5)),0);
+  const totalQty=data.reduce((s,i)=>s+(parseFloat(i.qty)||0),0);
+
+  document.getElementById('rptCards').innerHTML=`
+    <div class="dash-card"><label>Records</label><div class="val">${data.length}</div></div>
+    <div class="dash-card gold"><label data-translate="lblAmount">Total Amount (Rs)</label><div class="val">${totalAmt.toLocaleString()}</div></div>
+    <div class="dash-card"><label>Total Neat Wt (KG)</label><div class="val">${totalNeatWt.toFixed(1)}</div></div>
+    <div class="dash-card"><label>Total Tare Wt (KG)</label><div class="val">${totalTare.toFixed(1)}</div></div>
+    <div class="dash-card red"><label>Total Wastage (KG)</label><div class="val">${totalWaste.toFixed(1)}</div></div>
+    <div class="dash-card"><label>Net After Wastage (KG)</label><div class="val">${totalNetAfter.toFixed(1)}</div></div>`;
+
+  document.getElementById('rptBody').innerHTML=data.map(i=>`
+    <tr><td><b>${i.invNo}</b></td><td>${i.date}</td><td>${shortDesc(i.desc)}</td>
+    <td>${i.qty||'—'}</td><td>${i.totalWt||0} KG</td><td>${i.neatWt||0} KG</td>
+    <td>${i.waste||0} KG</td><td>${i.neatAfter||0} KG</td>
+    <td>Rs ${i.rate}</td><td><b>Rs ${i.amount.toLocaleString()}</b></td><td>${i.person}</td></tr>`).join('')
+    ||'<tr><td colspan="11" style="text-align:center;color:var(--gray);padding:16px;">No records</td></tr>';
+
+  document.getElementById('rptFoot').innerHTML=`<tr>
+    <td colspan="3"><b>TOTAL</b></td>
+    <td><b>${totalQty}</b></td>
+    <td><b>${data.reduce((s,i)=>s+(parseFloat(i.totalWt)||0),0).toFixed(1)} KG</b></td>
+    <td><b>${totalNeatWt.toFixed(1)} KG</b></td>
+    <td><b>${totalWaste.toFixed(1)} KG</b></td>
+    <td><b>${totalNetAfter.toFixed(1)} KG</b></td>
+    <td>—</td><td><b>Rs ${totalAmt.toLocaleString()}</b></td><td>—</td></tr>`;
+
+  document.getElementById('reportResult').style.display='block';
+}
+
+function clearReport() {
+  document.getElementById('rptFrom').value='';
+  document.getElementById('rptTo').value='';
+  document.getElementById('rptPerson').value='';
+  document.getElementById('rptPackType').value='';
+  document.getElementById('reportResult').style.display='none';
+}
+
+// ════════════ PENDING BILLS ════════════
+let pendingBills = JSON.parse(localStorage.getItem('aaf_pendingBills') || 'null');
+if (!pendingBills) {
+  pendingBills = [
+    { person: 'Sarfaraz Abbasi', date: '2025-11-06', desc: 'Naran', contact: '', amount: '565880', status: 'Pending' },
+    { person: 'Sarfaraz Abbasi', date: '2026-02-05', desc: 'Bakaya — Mansehra', contact: '', amount: '9097781', status: 'Pending' }
+  ];
+  localStorage.setItem('aaf_pendingBills', JSON.stringify(pendingBills));
+}
+
+function savePendingBillsLS() {
+  localStorage.setItem('aaf_pendingBills', JSON.stringify(pendingBills));
+}
+
+function renderPending() {
+  const tbody = document.getElementById('pbBody');
+  if (!tbody) return;
+  if (!pendingBills.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--gray);padding:16px;">Koi pending bill nahi</td></tr>';
+    document.getElementById('pbTotal').textContent = 'Rs 0';
+    return;
+  }
+  const statusColor = { Pending: '#c0392b', Partial: '#e67e22', Cleared: '#27ae60' };
+  const statusEmoji = { Pending: '🔴', Partial: '🟡', Cleared: '🟢' };
+  tbody.innerHTML = pendingBills.map((b, i) => `<tr>
+    <td>${i + 1}</td>
+    <td><b>${b.person}</b></td>
+    <td>${b.date || '—'}</td>
+    <td>${b.desc}</td>
+    <td>${b.contact || '—'}</td>
+    <td><b>Rs ${Number(b.amount || 0).toLocaleString()}</b></td>
+    <td><span style="color:${statusColor[b.status]};font-weight:700;">${statusEmoji[b.status]} ${b.status}</span></td>
+    <td>
+      <button class="btn btn-gray btn-sm" onclick="editPendingBill(${i})">✏️</button>
+      <button class="btn btn-red btn-sm" onclick="deletePendingBill(${i})">🗑️</button>
+    </td>
+  </tr>`).join('');
+
+  const pendingOnly = pendingBills.filter(b => b.status !== 'Cleared');
+  const total = pendingOnly.reduce((s, b) => s + Number(b.amount || 0), 0);
+  document.getElementById('pbTotal').textContent = 'Rs ' + total.toLocaleString();
+  // Grand total — report total + pending
+  const reportTotal = currentReport.length ? currentReport.reduce((s,i)=>s+i.amount,0) : 0;
+  const grandEl = document.getElementById('pbGrandTotal');
+  if (grandEl) grandEl.textContent = reportTotal ? 'Rs ' + (reportTotal + total).toLocaleString() : 'Rs ' + total.toLocaleString() + ' (+ Report)';
+}
+
+function savePendingBill() {
+  const id = document.getElementById('pbEditId').value;
+  const bill = {
+    person: document.getElementById('pbPerson').value.trim(),
+    date: document.getElementById('pbDate').value,
+    desc: document.getElementById('pbDesc').value.trim(),
+    contact: document.getElementById('pbContact').value.trim(),
+    amount: document.getElementById('pbAmount').value,
+    status: document.getElementById('pbStatus').value
+  };
+  if (!bill.person || !bill.desc) { toast('Person aur Description zaroor bharein', 'error'); return; }
+  if (id !== '') {
+    pendingBills[parseInt(id)] = bill;
+    toast('Bill update ho gaya', 'success');
+  } else {
+    pendingBills.push(bill);
+    toast('Pending bill save ho gaya', 'success');
+  }
+  savePendingBillsLS();
+  cancelPbEdit();
+  renderPending();
+}
+
+function editPendingBill(i) {
+  const b = pendingBills[i];
+  document.getElementById('pbEditId').value = i;
+  document.getElementById('pbPerson').value = b.person;
+  document.getElementById('pbDate').value = b.date || '';
+  document.getElementById('pbDesc').value = b.desc;
+  document.getElementById('pbContact').value = b.contact || '';
+  document.getElementById('pbAmount').value = b.amount || '';
+  document.getElementById('pbStatus').value = b.status;
+  document.getElementById('pbFormTitle').textContent = '✏️ Bill Edit Karein';
+  document.getElementById('pbPerson').focus();
+}
+
+function deletePendingBill(i) {
+  if (!confirm('Yeh pending bill delete karein?')) return;
+  pendingBills.splice(i, 1);
+  savePendingBillsLS();
+  renderPending();
+  toast('Deleted', 'info');
+}
+
+function cancelPbEdit() {
+  document.getElementById('pbEditId').value = '';
+  document.getElementById('pbPerson').value = '';
+  document.getElementById('pbDate').value = '';
+  document.getElementById('pbDesc').value = '';
+  document.getElementById('pbContact').value = '';
+  document.getElementById('pbAmount').value = '';
+  document.getElementById('pbStatus').value = 'Pending';
+  document.getElementById('pbFormTitle').textContent = '➕ Naya Pending Bill';
+}
+
+function getPendingBillsHTML(reportTotal) {
+  if (!pendingBills.length) return { html: '', pendingTotal: 0 };
+  const statusColor = { Pending: '#c0392b', Partial: '#e67e22', Cleared: '#27ae60' };
+  const rows = pendingBills.map(b => `<tr>
+    <td><b>${b.person}</b></td>
+    <td>${fmtDate(b.date)}</td>
+    <td>${b.desc}</td>
+    <td>${b.contact || '—'}</td>
+    <td style="text-align:right;"><b>Rs ${Number(b.amount || 0).toLocaleString()}</b></td>
+    <td style="color:${statusColor[b.status]};font-weight:700;">${b.status}</td>
+  </tr>`).join('');
+  const pendingOnly = pendingBills.filter(b => b.status !== 'Cleared');
+  const pendingTotal = pendingOnly.reduce((s, b) => s + Number(b.amount || 0), 0);
+  const grandTotal = (reportTotal || 0) + pendingTotal;
+  const html = `
+  <div class="pending-section" style="page-break-inside:avoid;">
+    <div class="pending-title">⚠️ Pending Bills</div>
+    <table class="pending-table">
+      <thead><tr><th>Person</th><th>Date</th><th>Description</th><th>Contact</th><th style="text-align:right;">Amount</th><th>Status</th></tr></thead>
+      <tbody>${rows}</tbody>
+      <tfoot>
+        <tr><td colspan="4"><b>Total Pending (Cleared ke baghair)</b></td><td style="text-align:right;"><b>Rs ${pendingTotal.toLocaleString()}</b></td><td></td></tr>
+        <tr style="border-top:3px solid #1a5c2a;">
+          <td colspan="4" style="color:#1a5c2a;padding:5px;font-size:.72rem;"><b>🧾 GRAND TOTAL (Report + Pending)</b></td>
+          <td style="text-align:right;font-size:.72rem;color:#1a5c2a;padding:5px;"><b>Rs ${grandTotal.toLocaleString()}</b></td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>`;
+  return { html, pendingTotal };
+}
+
+// ════════════ PRINT REPORT ════════════
+function printReport() {
+  if(!currentReport.length){toast('Pehle report generate karein!','info');return;}
+  const data=currentReport;
+  const from=document.getElementById('rptFrom').value;
+  const to=document.getElementById('rptTo').value;
+  const person=document.getElementById('rptPerson').value.trim();
+  const totalAmt=data.reduce((s,i)=>s+i.amount,0);
+  const totalKg=data.reduce((s,i)=>s+(parseFloat(i.neatAfter)||0),0);
+  const totalWaste=data.reduce((s,i)=>s+(parseFloat(i.waste)||0),0);
+  const totalNeat=data.reduce((s,i)=>s+(parseFloat(i.neatWt)||0),0);
+  const totalQty=data.reduce((s,i)=>s+(parseFloat(i.qty)||0),0);
+  const totalTotalWt=data.reduce((s,i)=>s+(parseFloat(i.totalWt)||0),0);
+  const rows=data.map(i=>`<tr>
+    <td>${i.invNo}</td><td>${fmtDate(i.date)}</td><td>${shortDesc(i.desc)}</td><td>${i.qty||'—'}</td>
+    <td>${parseFloat(i.totalWt)||0} KG</td><td>${parseFloat(i.neatWt)||0} KG</td>
+    <td>${parseFloat(i.waste)||0} KG</td><td>${parseFloat(i.neatAfter)||0} KG</td>
+    <td>Rs ${i.rate}</td><td><b>Rs ${parseFloat(i.amount).toLocaleString()}</b></td>
+  </tr>`).join('');
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Ahsin Agri Farm — Report</title>
+  <style>@page{size:A4 portrait;margin:8mm 6mm;}*{box-sizing:border-box;}body{font-family:Arial,sans-serif;margin:0;color:#0f1f13;font-size:.62rem;}
+  h2{color:#1a5c2a;font-size:1.05rem;margin:0;}.sub{color:#5a6a5e;font-size:.62rem;margin-top:2px;}
+  .header{text-align:center;border-bottom:3px solid #1a5c2a;padding-bottom:7px;margin-bottom:9px;}
+  .cards{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-bottom:10px;}
+  .card{border:1px solid #cdd9cf;border-radius:4px;padding:5px 6px;}
+  .card.green{border-left:3px solid #1a5c2a;}.card.gold{border-left:3px solid #c9960a;}.card.red{border-left:3px solid #c0392b;}
+  .card label{font-size:.52rem;text-transform:uppercase;color:#5a6a5e;display:block;}.card .val{font-size:.82rem;font-weight:700;color:#1a5c2a;}
+  .card.gold .val{color:#c9960a;}.card.red .val{color:#c0392b;}
+  table{width:100%;border-collapse:collapse;font-size:.58rem;table-layout:fixed;}
+  thead tr{background:#1a5c2a;color:#fff;}th{padding:4px 3px;text-align:left;}
+  td{padding:3px;border-bottom:1px solid #e4ede6;}tr:nth-child(even){background:#f4faf5;}
+  tr.total-row td{font-weight:700;background:#e8f5eb;border-top:2px solid #1a5c2a;page-break-inside:avoid;page-break-before:avoid;}
+  /* Column widths: Inv# Date Desc Qty TotalWt NeatWt Wastage NetAfterW Rate Amount */
+  th:nth-child(1),td:nth-child(1){width:7%;}
+  th:nth-child(2),td:nth-child(2){width:9%;}
+  th:nth-child(3),td:nth-child(3){width:14%;}
+  th:nth-child(4),td:nth-child(4){width:5%;}
+  th:nth-child(5),td:nth-child(5){width:10%;}
+  th:nth-child(6),td:nth-child(6){width:10%;}
+  th:nth-child(7),td:nth-child(7){width:10%;}
+  th:nth-child(8),td:nth-child(8){width:10%;}
+  th:nth-child(9),td:nth-child(9){width:7%;}
+  th:nth-child(10),td:nth-child(10){width:18%;text-align:right;}
+  .footer{margin-top:8px;text-align:center;font-size:.55rem;color:#888;border-top:1px solid #cdd9cf;padding-top:5px;}
+  .pending-section{margin-top:14px;border:2px solid #c0392b;border-radius:5px;padding:8px 10px;}
+  .pending-title{font-size:.72rem;font-weight:700;color:#c0392b;margin-bottom:6px;letter-spacing:.3px;}
+  .pending-table{width:100%;border-collapse:collapse;font-size:.58rem;}
+  .pending-table thead tr{background:#c0392b;color:#fff;}
+  .pending-table th,.pending-table td{padding:3px 5px;border-bottom:1px solid #f0c0bb;}
+  .pending-table tfoot td{font-weight:700;background:#fdecea;border-top:2px solid #c0392b;}
+  .badge-pending{background:#c0392b;color:#fff;padding:1px 5px;border-radius:3px;font-size:.5rem;font-weight:700;}
+  </style></head><body>
+  <div class="header"><h2 data-translate="mobileTitle">🌿 Ahsin Agri Farm</h2><div class="sub">Shoukat, Khanpur Shinkiari, KPK</div>
+  <div class="sub">Period: ${from||'All'} to ${to||'All'}${person?' | Person: '+person:''}</div></div>
+  <div class="cards">
+    <div class="card green"><label>Records</label><div class="val">${data.length}</div></div>
+    <div class="card gold"><label>Total Amount</label><div class="val">Rs ${totalAmt.toLocaleString()}</div></div>
+    <div class="card green"><label>Total Neat Wt</label><div class="val">${totalNeat.toFixed(1)} KG</div></div>
+    <div class="card green"><label>Net After Waste</label><div class="val">${totalKg.toFixed(1)} KG</div></div>
+    <div class="card red"><label>Total Wastage</label><div class="val">${totalWaste.toFixed(1)} KG</div></div>
+  </div>
+  <table><thead><tr><th>Inv#</th><th data-translate="thDate">Date</th><th data-translate="thDescription">Description</th><th data-translate="thQty">Qty</th>
+    <th>Total Wt</th><th>Neat Wt</th><th>Wastage</th><th>Net After W</th><th>Rate</th><th>Amount</th></tr></thead>
+  <tbody>${rows}
+  <tr class="total-row">
+    <td colspan="3"><b>TOTAL</b></td>
+    <td><b>${totalQty}</b></td>
+    <td><b>${totalTotalWt.toFixed(1)}</b></td>
+    <td><b>${totalNeat.toFixed(1)}</b></td>
+    <td><b>${totalWaste.toFixed(1)}</b></td>
+    <td><b>${totalKg.toFixed(1)}</b></td>
+    <td>-</td>
+    <td style="text-align:right;font-size:.56rem;word-break:break-all;"><b>Rs ${totalAmt.toLocaleString()}</b></td>
+  </tr>
+  </tbody></table>
+  ${getPendingBillsHTML(totalAmt).html}
+  <div class="footer">Ahsin Agri Farm — Printed on ${new Date().toLocaleDateString('en-PK')}</div>
+  </body></html>`;
+  const w=window.open('','_blank','width=900,height=700');
+  w.document.write(html); w.document.close(); w.focus();
+  setTimeout(()=>w.print(),400);
+}
+
+// ════════════ PDF EXPORT ════════════
+function downloadPDF() {
+  try {
+    const {jsPDF}=window.jspdf;
+    const doc=new jsPDF();
+    doc.setFont('helvetica','bold');
+    doc.setFontSize(18); doc.setTextColor(26,92,42);
+    doc.text('Ahsin Agri Farm',14,18);
+    doc.setFontSize(9); doc.setFont('helvetica','normal');
+    doc.setTextColor(90,106,94);
+    doc.text('Khanpur Shinkiari, Mansehra, KPK',14,24);
+    const invNo=document.getElementById('pInvNo').textContent;
+    const invDate=document.getElementById('pInvDate').textContent;
+    const person=document.getElementById('pPerson').textContent;
+    const total=document.getElementById('pTotal').textContent;
+    doc.setFont('helvetica','bold'); doc.setFontSize(14); doc.setTextColor(26,92,42);
+    doc.text(invNo,200,18,{align:'right'});
+    doc.setFontSize(9); doc.setFont('helvetica','normal');
+    doc.text(invDate,200,24,{align:'right'});
+    doc.line(14,28,196,28);
+    doc.setFontSize(9); doc.setTextColor(0,0,0);
+    doc.text('From: Ahsin Agri Farm',14,34);
+    doc.text('Received By: '+person,14,40);
+
+    const inv=invoices.find(i=>i.invNo===invNo);
+    if(inv){
+      doc.autoTable({
+        startY:46,
+        head:[['Description','Qty','Total Wt','Neat Wt','Wastage','Net After W','Rate','Amount']],
+        body:[[inv.desc,inv.qty,inv.totalWt+' KG',inv.neatWt+' KG',inv.waste+' KG',inv.neatAfter+' KG','Rs '+inv.rate,'Rs '+inv.amount.toLocaleString()]],
+        styles:{fontSize:8,cellPadding:3},
+        headStyles:{fillColor:[26,92,42],textColor:255},
+        alternateRowStyles:{fillColor:[244,250,245]}
+      });
+      const finalY=doc.lastAutoTable.finalY+8;
+      doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(26,92,42);
+      doc.text('TOTAL AMOUNT: '+total,196,finalY,{align:'right'});
+    }
+    doc.setFontSize(7); doc.setFont('helvetica','normal'); doc.setTextColor(150);
+    doc.text('Generated by Ahsin Agri Farm Pro System — '+new Date().toLocaleDateString('en-PK'),14,285);
+    doc.save(`${invNo}_${invDate}.pdf`);
+    toast('📄 PDF downloaded!');
+  } catch(e){ toast('PDF error: '+e.message,'error'); }
+}
+
+function exportReportPDF() {
+  if(!currentReport.length){toast('Generate report first','info');return;}
+  try {
+    const {jsPDF}=window.jspdf;
+    const doc=new jsPDF('l','mm','a4');
+    doc.setFont('helvetica','bold'); doc.setFontSize(16); doc.setTextColor(26,92,42);
+    doc.text('Ahsin Agri Farm — Report',14,16);
+    doc.setFontSize(9); doc.setFont('helvetica','normal'); doc.setTextColor(90);
+    doc.text('Generated: '+new Date().toLocaleDateString('en-PK'),14,22);
+    doc.autoTable({
+      startY:28,
+      head:[['Inv#','Date','Description','Qty','Total Wt','Neat Wt','Wastage','Net After W','Rate','Amount','Person']],
+      body:currentReport.map(i=>[i.invNo,i.date,shortDesc(i.desc),i.qty||'—',i.totalWt+' KG',i.neatWt+' KG',i.waste+' KG',i.neatAfter+' KG','Rs '+i.rate,'Rs '+i.amount.toLocaleString(),i.person]),
+      styles:{fontSize:7,cellPadding:2},
+      headStyles:{fillColor:[26,92,42],textColor:255},
+      alternateRowStyles:{fillColor:[244,250,245]}
+    });
+    doc.save('AhsinAgriFarm_Report_'+new Date().toISOString().slice(0,10)+'.pdf');
+    toast('📄 Report PDF downloaded!');
+  } catch(e){ toast('PDF error: '+e.message,'error'); }
+}
+
+// ════════════ EXCEL EXPORT ════════════
+function exportXLSX() {
+  const data=currentReport.length?currentReport:invoices;
+  if(!data.length){toast('No data to export','info');return;}
+  const ws=XLSX.utils.json_to_sheet(data.map(i=>({
+    'Invoice#':i.invNo,'Date':i.date,'Description':i.desc,'Quantity':i.qty,
+    'Total Weight(KG)':i.totalWt,'Neat Weight(KG)':i.neatWt,
+    'Wastage(KG)':i.waste,'Wastage%':i.wastePct,
+    'Net After Wastage(KG)':i.neatAfter,'Rate(Rs)':i.rate,
+    'Amount(Rs)':i.amount,'Received By':i.person,'Status':i.status,'Notes':i.notes
+  })));
+  ws['!cols']=[{wch:10},{wch:12},{wch:22},{wch:8},{wch:14},{wch:14},{wch:12},{wch:10},{wch:18},{wch:10},{wch:14},{wch:18},{wch:8},{wch:20}];
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Invoices');
+  XLSX.writeFile(wb,'AhsinAgriFarm_'+new Date().toISOString().slice(0,10)+'.xlsx');
+  toast('📊 Excel exported!');
+}
+function exportReportXLSX(){ exportXLSX(); }
+
+// ════════════ CSV ════════════
+function exportCSV(){ exportToCSV(currentReport.length?currentReport:invoices); }
+function exportReportCSV(){ exportToCSV(currentReport); }
+function exportToCSV(data) {
+  if(!data.length){toast('No data','info');return;}
+  const headers=['Invoice#','Date','Description','Quantity','Total Weight(KG)','Neat Weight(KG)','Wastage(KG)','Net After Wastage(KG)','Rate(Rs)','Amount(Rs)','Received By','Status','Notes'];
+  const rows=data.map(i=>[i.invNo,i.date,i.desc,i.qty,i.totalWt,i.neatWt,i.waste,i.neatAfter,i.rate,i.amount,i.person,i.status,i.notes]);
+  const csv=[headers,...rows].map(r=>r.map(v=>`"${v||''}"`).join(',')).join('\n');
+  const a=document.createElement('a');
+  a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);
+  a.download='AhsinAgriFarm_'+new Date().toISOString().slice(0,10)+'.csv';
+  a.click();
+}
+
+// ════════════ BACKUP ════════════
+function updateBackupStatus() {
+  const now=new Date();
+  document.getElementById('backupStatus').textContent=
+    '✅ Last saved: '+now.toLocaleTimeString('en-PK',{hour:'2-digit',minute:'2-digit'});
+  if (typeof triggerLocalAutoBackup === 'function') {
+    triggerLocalAutoBackup().catch(err => console.error('Local auto-backup failed:', err));
+  }
+}
+
+async function resetAllData() {
+  if (!confirm('⚠️ WARNING: Ye tamam invoices delete kar dega!\nKya aap sure hain?')) return;
+  if (!confirm('Last warning! Sab data permanently delete ho jaye ga. Continue?')) return;
+  invoices = [];
+  trashItems = [];
+  await dbClear('invoices');
+  await dbClear('trash');
+  await setSetting('wasReset', true);
+  
+  // Pausing auto-backup to protect the backup file on disk from being overwritten
+  localBackupHandle = null;
+  localBackupPath = null;
+  await setSetting('localBackupHandle', null);
+  await setSetting('localBackupPath', null);
+  if (typeof initLocalBackup === 'function') {
+    await initLocalBackup();
+  }
+  
+  renderAll();
+  document.getElementById('invNo').value = nextInvNo();
+  toast('✅ All data reset ho gaya! (Auto-Backup paused to protect your disk file)', 'error');
+}
+
+async function mergeBackup(input) {
+  const files = Array.from(input.files);
+  if (!files.length) return;
+  let loaded = 0;
+  let allImported = [];
+
+  files.forEach(file => {
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      try {
+        const data = JSON.parse(e.target.result);
+        const imported = data.invoices || data;
+        if (Array.isArray(imported)) allImported = allImported.concat(imported);
+      } catch(err) { toast('❌ Invalid file: ' + file.name, 'error'); }
+      loaded++;
+      if (loaded === files.length) finishMerge();
+    };
+    reader.readAsText(file);
+  });
+
+  async function finishMerge() {
+    // Combine current + imported, deduplicate by id (unique timestamp)
+    const allById = new Map();
+    [...invoices, ...allImported].forEach(i => allById.set(i.id, i));
+    let combined = [...allById.values()];
+
+    // Sort by date ascending (purani pehle, nayi baad mein)
+    combined.sort((a, b) => {
+      if (a.date !== b.date) return a.date.localeCompare(b.date);
+      return a.id - b.id; // same date: id se sort
+    });
+
+    // Re-sequence invoice numbers AAF-001, AAF-002... date order mein
+    combined = combined.map((inv, idx) => ({
+      ...inv,
+      invNo: 'AAF-' + String(idx + 1).padStart(3, '0')
+    }));
+
+    const added = combined.length - invoices.length;
+
+    // Store newest first for display
+    invoices = [...combined].reverse();
+
+    await setSetting('wasReset', false);
+    await saveData(); renderAll();
+    document.getElementById('invNo').value = nextInvNo();
+    toast('✅ Merge complete! ' + added + ' records added. Total: ' + invoices.length + ' — Invoice numbers re-sequenced!');
+    input.value = '';
+  }
+}
+
+function downloadBackup() {
+  if(!invoices.length){toast('No data to backup!','info');return;}
+  // Pending Bills bhi include karo
+  const pb = JSON.parse(localStorage.getItem('aaf_pendingBills')||'null');
+  const data=JSON.stringify({
+    version:3,
+    exported:new Date().toISOString(),
+    count:invoices.length,
+    invoices,
+    trash: trashItems||[],
+    pendingBills: pb||[]
+  },null,2);
+  const a=document.createElement('a');
+  a.href='data:application/json;charset=utf-8,'+encodeURIComponent(data);
+  const now=new Date();
+  const dd=String(now.getDate()).padStart(2,'0');
+  const mm=String(now.getMonth()+1).padStart(2,'0');
+  const yyyy=now.getFullYear();
+  a.download=`${dd}-${mm}-${yyyy}_Waseem_Sarfaraz_Full.json`;
+  a.click();
+  toast('✅ Full Backup downloaded! (Invoices + Pending Bills)');
+}
+
+async function restoreBackup(input) {
+  const file=input.files[0]; if(!file) return;
+  const reader=new FileReader();
+  reader.onload=async function(e){
+    try {
+      const data=JSON.parse(e.target.result);
+      const imported=data.invoices||data;
+      if(!Array.isArray(imported)) throw new Error('Invalid format');
+      if(!confirm('This will REPLACE all current data with '+imported.length+' records. Continue?')){input.value='';return;}
+      invoices=imported;
+      await dbClear('invoices');
+      await dbBulkPut('invoices', invoices);
+      await setSetting('wasReset', false);
+      // Pending Bills bhi restore karo
+      if(data.pendingBills && Array.isArray(data.pendingBills) && data.pendingBills.length>0){
+        pendingBills = data.pendingBills;
+        localStorage.setItem('aaf_pendingBills', JSON.stringify(pendingBills));
+      }
+      // Trash bhi restore karo
+      if(data.trash && Array.isArray(data.trash) && data.trash.length>0){
+        trashItems = data.trash;
+        await dbClear('trash');
+        await dbBulkPut('trash', trashItems);
+      }
+      renderAll();
+      if(typeof renderTrash==='function') renderTrash();
+      // Cloud mein bhi push karo
+      if(typeof wsFbPush==='function') wsFbPush();
+      toast('✅ Full Backup restored! '+imported.length+' invoices + Pending Bills loaded.');
+    } catch(err){ toast('❌ Invalid backup file!','error'); }
+    input.value='';
+  };
+  reader.readAsText(file);
+}
+
+// ════════════ HELPERS ════════════
+function updatePersonLists() {
+  const persons=[...new Set(invoices.map(i=>i.person))].sort();
+  ['personList','personList2'].forEach(id=>{
+    const dl=document.getElementById(id);
+    if(dl) dl.innerHTML=persons.map(p=>`<option value="${p}">`).join('');
+  });
+}
+function updateMonthFilter() {
+  const months=[...new Set(invoices.map(i=>i.date.slice(0,7)))].sort().reverse();
+  const sel=document.getElementById('filterMonth');
+  const cur=sel.value;
+  sel.innerHTML='<option value="">All Months</option>'+
+    months.map(m=>`<option value="${m}" ${m===cur?'selected':''}>${m}</option>`).join('');
+}
+function renderAll() {
+  renderDashboard(); updatePersonLists(); updateMonthFilter();
+}
+
+// ════════════ GOOGLE DRIVE ════════════
+const GDRIVE_CLIENT_ID='519842135748-k8o4vn8rg5561r92daci9ksc9d3i032n.apps.googleusercontent.com';
+const GDRIVE_SCOPES='https://www.googleapis.com/auth/drive.file';
+const BACKUP_FILENAME='AhsinAgriFarm_Backup.json';
+let gapiReady=false, gisReady=false, tokenClient, driveAccessToken=null;
+
+function gapiLoaded(){gapi.load('client',async()=>{await gapi.client.init({});await gapi.client.load('https://www.googleapis.com/discovery/v1/apis/drive/v3/rest');gapiReady=true;maybeEnableDrive();});}
+function gisLoaded(){if(!GDRIVE_CLIENT_ID) return;tokenClient=google.accounts.oauth2.initTokenClient({client_id:GDRIVE_CLIENT_ID,scope:GDRIVE_SCOPES,callback:(resp)=>{if(resp.error){driveStatusMsg('❌ Sign in failed',true);return;}driveAccessToken=resp.access_token;fetch('https://www.googleapis.com/oauth2/v3/userinfo',{headers:{Authorization:'Bearer '+driveAccessToken}}).then(r=>r.json()).then(u=>{document.getElementById('driveUserName').textContent='👤 '+(u.name||u.email);document.getElementById('driveSignedOut').style.display='none';document.getElementById('driveSignedIn').style.display='flex';driveStatusMsg('✅ Connected!');setTimeout(()=>driveStatusMsg(''),2000);});}});gisReady=true;maybeEnableDrive();}
+function maybeEnableDrive(){
+  if (window.location.protocol === 'file:') {
+    const dbEl = document.getElementById('driveBar');
+    if (dbEl) {
+      dbEl.innerHTML = '<span style="color:var(--gold);font-size:.72rem;font-weight:700;cursor:help;border-bottom:1px dashed var(--gold);" title="Google security policy local HTML files (file:///) par Google Drive authorization ko block karti hai. Iska permanent solution Settings Tab mein `Local Disk Auto-Backup` configure karna hai.">⚠️ Google Drive (Blocked on Local Files)</span>';
+    }
+  } else if(!GDRIVE_CLIENT_ID){
+    document.getElementById('driveBar').innerHTML='<span style="color:#f0c040;font-size:.72rem;">⚠️ Google Client ID needed</span>';
+  }
+}
+function gdriveSignIn(){if(!GDRIVE_CLIENT_ID){alert('Google Client ID set nahi hai!');return;}tokenClient.requestAccessToken({prompt:'consent'});}
+function gdriveSignOut(){google.accounts.oauth2.revoke(driveAccessToken,()=>{driveAccessToken=null;document.getElementById('driveSignedOut').style.display='flex';document.getElementById('driveSignedIn').style.display='none';driveStatusMsg('Signed out');setTimeout(()=>driveStatusMsg(''),2000);});}
+function driveStatusMsg(msg,isErr=false){const el=document.getElementById('driveStatus');el.textContent=msg;el.style.color=isErr?'#ff6b6b':'#f0c040';el.style.display=msg?'inline':'none';}
+async function gdriveBackup(){if(!driveAccessToken){gdriveSignIn();return;}if(!invoices.length){alert('No invoices!');return;}driveStatusMsg('⏳ Saving...');try{const body=JSON.stringify({version:2,exported:new Date().toISOString(),invoices},null,2);const listRes=await gapi.client.drive.files.list({q:`name='${BACKUP_FILENAME}' and trashed=false`,fields:'files(id,name)'});const files=listRes.result.files;let fileId=files.length?files[0].id:null;const metadata={name:BACKUP_FILENAME,mimeType:'application/json'};const form=new FormData();form.append('metadata',new Blob([JSON.stringify(metadata)],{type:'application/json'}));form.append('file',new Blob([body],{type:'application/json'}));const uploadUrl=fileId?`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=multipart`:'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';const res=await fetch(uploadUrl,{method:fileId?'PATCH':'POST',headers:{Authorization:'Bearer '+driveAccessToken},body:form});if(!res.ok) throw new Error(await res.text());driveStatusMsg('✅ Saved '+invoices.length+' records');setTimeout(()=>driveStatusMsg(''),3000);}catch(e){driveStatusMsg('❌ '+e.message,true);}}
+async function gdriveRestore(){if(!driveAccessToken){gdriveSignIn();return;}driveStatusMsg('⏳ Restoring...');try{const listRes=await gapi.client.drive.files.list({q:`name='${BACKUP_FILENAME}' and trashed=false`,fields:'files(id,name,modifiedTime)'});const files=listRes.result.files;if(!files.length){driveStatusMsg('❌ No backup found',true);return;}const fileId=files[0].id;const modTime=new Date(files[0].modifiedTime).toLocaleString('en-PK');if(!confirm(`Drive backup found:\n📅 ${modTime}\n\nLoad this data? Current data will be replaced!`)){driveStatusMsg('');return;}const dlRes=await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,{headers:{Authorization:'Bearer '+driveAccessToken}});const data=await dlRes.json();const imported=data.invoices||data;if(!Array.isArray(imported)) throw new Error('Invalid format');invoices=imported;await dbClear('invoices');await dbBulkPut('invoices',invoices);await setSetting('wasReset',false);renderAll();driveStatusMsg('✅ Restored '+imported.length+' records');setTimeout(()=>driveStatusMsg(''),3000);}catch(e){driveStatusMsg('❌ '+e.message,true);}}
+function autoGdriveBackup(){if(driveAccessToken) setTimeout(gdriveBackup,500);}
+function waitForGoogle(){if(typeof gapi!=="undefined"&&!gapiReady) gapiLoaded();if(typeof google!=="undefined"&&google.accounts&&!gisReady) gisLoaded();if(!gapiReady||!gisReady) setTimeout(waitForGoogle,300);}
+setTimeout(waitForGoogle,500);
+
+// ════════════ PRINT ════════════
+function printInvoice() {
+  const preview = document.getElementById('invoicePreview');
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Invoice Print</title>
+<style>
+  @page { size: A4 portrait; margin: 8mm 10mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  .no-print, .btn-row { display: none !important; }
+  body { font-family: 'Arial', sans-serif; color: #0f1f13; background: #fff; }
+  .inv-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:14px; }
+  .inv-farm h2 { color:#1a5c2a; font-size:1.4rem; font-weight:900; }
+  .inv-farm p { color:#5a6a5e; font-size:.82rem; margin-top:2px; }
+  .inv-no h3 { font-size:1.6rem; font-weight:900; color:#1a5c2a; text-align:right; }
+  .inv-no p { color:#5a6a5e; font-size:.82rem; text-align:right; }
+  .inv-no .official { color:#c9960a; font-size:.72rem; text-align:right; }
+  hr { border:none; border-top:2px solid #1a5c2a; margin:10px 0; }
+  .inv-parties { display:flex; gap:30px; margin-bottom:14px; }
+  .inv-party h4 { font-size:.7rem; text-transform:uppercase; color:#5a6a5e; margin-bottom:3px; }
+  .inv-party p { font-weight:700; font-size:1rem; }
+  .inv-party small { color:#5a6a5e; font-size:.8rem; }
+  .inv-qr-bar { display:flex; justify-content:space-between; align-items:center; margin:8px 0; gap:16px; }
+  .inv-qr-bar img, .inv-qr-bar canvas { width:72px; height:72px; }
+  .scan-lbl { font-size:.6rem; color:#5a6a5e; text-align:center; margin-top:2px; }
+  .barcode-wrap { flex:1; text-align:center; }
+  .barcode-wrap svg { max-width:100%; height:38px; }
+  .print-info { text-align:right; font-size:.7rem; color:#5a6a5e; }
+  table { width:100%; border-collapse:collapse; font-size:.82rem; margin-bottom:14px; }
+  thead tr { background:#1a5c2a; color:#fff; }
+  th { padding:7px 9px; text-align:left; }
+  td { padding:6px 9px; border-bottom:1px solid #e4ede6; }
+  tr:nth-child(even) td { background:#f4faf5; }
+  .inv-totals { margin-left:auto; max-width:300px; font-size:.88rem; }
+  .inv-totals .row { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid #e4ede6; }
+  .inv-totals .total { font-weight:700; font-size:1.05rem; color:#1a5c2a; border-bottom:2px solid #1a5c2a; }
+  .terms { margin-top:14px; font-size:.68rem; color:#5a6a5e; border:1px dashed #cdd9cf; padding:8px 12px; border-radius:6px; }
+  .inv-sig { display:flex; gap:30px; margin-top:30px; margin-bottom:16px; }
+  .inv-sig > div { flex:1; text-align:center; }
+  .inv-sig .line { border-top:1.5px solid #0f1f13; margin-bottom:5px; }
+  .inv-sig span { font-size:.72rem; color:#5a6a5e; }
+  .inv-footer { text-align:center; font-size:.7rem; color:#5a6a5e; border-top:1px solid #e4ede6; padding-top:8px; }
+  .watermark { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%) rotate(-30deg); font-size:5rem; color:rgba(26,92,42,.06); font-weight:900; pointer-events:none; white-space:nowrap; z-index:0; }
+</style>
+</head>
+<body>
+<div class="watermark">AHSIN AGRI FARM</div>
+${preview.innerHTML.replace(/<div class="btn-row no-print"[\s\S]*?<\/div>\s*<\/div>/, '')}
+</body>
+</html>`;
+
+  const w = window.open('', '_blank', 'width=900,height=700');
+  w.document.write(html);
+  w.document.close();
+  w.focus();
+  setTimeout(() => { w.print(); }, 600);
+}
+
+// ════════════ INIT ════════════
+(async function init() {
+  // Show loading overlay
+  document.body.insertAdjacentHTML('beforeend',
+    '<div id="appLoader" style="position:fixed;inset:0;background:rgba(26,92,42,.92);z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;">' +
+    '<div style="font-family:serif;font-size:2rem;color:#f0c040;">🌿 Ahsin Agri Farm</div>' +
+    '<div style="color:#fff;font-size:.95rem;">Loading database...</div>' +
+    '<div style="width:200px;height:4px;background:rgba(255,255,255,.2);border-radius:4px;overflow:hidden;">' +
+    '<div id="loaderBar" style="height:100%;background:#f0c040;width:0%;transition:width .4s;"></div></div>' +
+    '</div>'
+  );
+  const bar = document.getElementById('loaderBar');
+  bar.style.width = '30%';
+
+  try {
+    // Init IndexedDB
+    await initDB();
+    bar.style.width = '60%';
+
+    // Load data
+    await loadData();
+    await loadProductSettings();
+    await initLocalBackup();
+    bar.style.width = '80%';
+
+    // Language
+    await initLanguage();
+
+    // Dark mode
+    await initDark();
+    bar.style.width = '100%';
+
+    setTimeout(() => {
+      document.getElementById('appLoader').remove();
+      renderAll();
+      showTab('invoice');
+      autoFillFromLastInvoice();
+      document.getElementById('invNo').value = nextInvNo();
+    }, 300);
+
+  } catch(err) {
+    console.error('Init failed:', err);
+    document.getElementById('appLoader').innerHTML =
+      '<div style="color:#fff;text-align:center;padding:30px;">' +
+      '<div style="font-size:2rem;">⚠️</div>' +
+      '<div style="font-size:1.1rem;margin:10px 0;">Database Error</div>' +
+      '<div style="font-size:.85rem;opacity:.8;">' + err.message + '</div>' +
+      '<button onclick="location.reload()" style="margin-top:16px;padding:8px 20px;background:#f0c040;border:none;border-radius:6px;cursor:pointer;font-weight:700;">Retry</button>' +
+      '</div>';
+  }
+})();
+
+</script>
+</body>
+</html>
