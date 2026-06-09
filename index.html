@@ -193,13 +193,25 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 
+// ── ONE-TIME CLOUD FETCH (startup ke liye) ──
+async function aafLoadFromCloud() {
+  if (!_aafReady) aafInitFb();
+  try {
+    const snap = await get(_aafRef);
+    return snap.val(); // null if empty, object if data exists
+  } catch(e) {
+    throw new Error('Firebase se data nahi aaya: ' + e.message);
+  }
+}
+
 // ── GLOBAL EXPORTS ──
-window.aafFbPush         = aafFbPush;
-window.aafFbPushAll      = aafFbPushAll;
+window.aafFbPush            = aafFbPush;
+window.aafFbPushAll         = aafFbPushAll;
 window.aafStartRealtimeSync = aafStartRealtimeSync;
-window.aafForceUpload    = aafForceUpload;
-window.aafSyncBadge      = aafSyncBadge;
-window.aafHideBadge      = aafHideBadge;
+window.aafForceUpload       = aafForceUpload;
+window.aafSyncBadge         = aafSyncBadge;
+window.aafHideBadge         = aafHideBadge;
+window.aafLoadFromCloud     = aafLoadFromCloud;
 </script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400;700&family=Playfair+Display:wght@700;900&family=Source+Sans+3:wght@300;400;600;700&display=swap');
@@ -1045,7 +1057,8 @@ tfoot td {
         <button class="btn btn-blue btn-sm" onclick="document.getElementById('mergeFileInput').click()" data-translate="btnMergeLocal">🔀 Merge</button>
         <input type="file" id="mergeFileInput" accept=".json" multiple onchange="mergeBackup(this)" style="display:none">
         <button class="btn btn-red btn-sm" onclick="resetAllData()" data-translate="btnResetData">🗑️ Reset</button>
-        <button class="btn btn-green btn-sm" onclick="aafForceUpload()" style="background:#065f46;">☁️ Send to Cloud</button>
+        <button class="btn btn-green btn-sm" onclick="aafFbPush ? aafFbPush() : aafForceUpload()" style="background:#065f46;">☁️ Send to Cloud</button>
+        <button class="btn btn-green btn-sm" onclick="aafForceUpload()" style="background:#0e7490;">⬆️ Upload to Cloud</button>
         <span id="aaf-sync-badge" style="display:none;font-size:.72rem;font-weight:700;padding:3px 10px;border-radius:99px;background:rgba(16,185,129,0.12);border:1px solid rgba(16,185,129,0.25);color:#10b981;white-space:nowrap;"></span>
         <span class="backup-status" id="backupStatus" style="font-size: 0.72rem; color: var(--green);"></span>
       </div>
@@ -1944,70 +1957,89 @@ async function saveTrash() {
 }
 
 async function loadData() {
-  // 1. Migrate old localStorage data first
-  await migrateFromLocalStorage();
+  // ════════════════════════════════════════════
+  // ☁️ CLOUD FIRST — LocalStorage/IndexedDB se
+  //    data KABHI nahi lena — sirf Firebase cloud
+  // ════════════════════════════════════════════
 
-  // 2. Load invoices from IndexedDB into allInvoices
-  allInvoices = await dbGetAll('invoices');
-
-  // 3. Force reseed if seed version is old or empty
-  const seedVer = await getSetting('seedVersion', 0);
-  const wasReset = await getSetting('wasReset', false);
-  if (seedVer < 3 && !wasReset) {
-    allInvoices = [...SEED_DATA, ...NADEEM_SEED_DATA];
-    await dbClear('invoices');
-    await dbBulkPut('invoices', allInvoices);
-    await setSetting('seedVersion', 3);
-  } else if (!allInvoices.length && !wasReset) {
-    allInvoices = [...SEED_DATA, ...NADEEM_SEED_DATA];
-    await dbBulkPut('invoices', allInvoices);
-    await setSetting('seedVersion', 3);
+  // Firebase module load hone ka thoda wait karo
+  let tries = 0;
+  while (typeof window.aafLoadFromCloud !== 'function' && tries < 20) {
+    await new Promise(r => setTimeout(r, 100));
+    tries++;
   }
 
-  // 4. Load trash + expire old items
-  trashItems = await dbGetAll('trash');
-  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  const before = trashItems.length;
-  trashItems = trashItems.filter(i => i.deletedAt > cutoff);
-  if (trashItems.length !== before) await saveTrash();
+  if (typeof window.aafLoadFromCloud !== 'function') {
+    throw new Error('☁️ Firebase load nahi hua. Page refresh karein.');
+  }
 
-  // 5. Load customer list from settings
-  const custRaw = await getSetting('customerList', null);
-  if (custRaw) {
-    customerList = (typeof custRaw === 'string') ? JSON.parse(custRaw) : custRaw;
+  // Cloud se data fetch karo
+  let cloudData = null;
+  try {
+    cloudData = await window.aafLoadFromCloud();
+  } catch(e) {
+    throw new Error('🔴 Internet nahi hai ya Firebase error: ' + e.message + '\n\nInternet connect karein aur page refresh karein.');
+  }
+
+  if (cloudData && cloudData.invoices && Array.isArray(cloudData.invoices)) {
+    // ✅ Cloud mein data hai — use karo
+    allInvoices = cloudData.invoices;
+    trashItems  = (cloudData.trash && Array.isArray(cloudData.trash)) ? cloudData.trash : [];
+
+    // Customer list cloud se
+    if (cloudData.customerList && Array.isArray(cloudData.customerList)) {
+      customerList = cloudData.customerList;
+    } else {
+      customerList = await buildDefaultCustomers();
+    }
+
   } else {
-    // Build Nadeem's formConfig with rate+amount hidden
-    const nadeemHiddenFields = ['rate','amount'];
-    const nadeemFormConfig = { fields: Object.fromEntries(
-      ['desc','customerName','qty','totalWt','tareWt','neatWt','wastePct','waste','neatAfter','rate','amount','person','notes'].map(k => [k, {
-        visible: !nadeemHiddenFields.includes(k),
-        defaultVal: k==='customerName'?'Nadeem':k==='person'?'Nadeem':''
-      }])
-    )};
-    customerList = [
-      { name: 'Sarfaraz Abbasi', prefix: 'AAF' },
-      { name: 'Nadeem', prefix: 'AAFN', formConfig: nadeemFormConfig }
-    ];
-    await setSetting('customerList', customerList);
-    // Save Nadeem's formConfig separately too
-    await setSetting('fc_Nadeem', nadeemFormConfig);
+    // ☁️ Cloud khali hy — pehli baar use, fresh start
+    allInvoices  = [];
+    trashItems   = [];
+    customerList = await buildDefaultCustomers();
   }
-  // Load each customer's formConfig from its own key (more reliable than embedded in customerList)
+
+  // Purana trash expire karo (30 din se zyada)
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  trashItems = trashItems.filter(i => i.deletedAt > cutoff);
+
+  // Customer formConfigs set karo
   for (let i = 0; i < customerList.length; i++) {
-    const fcRaw = await getSetting('fc_' + (customerList[i].name||'').replace(/\W/g,'_'), null);
-    if (fcRaw) {
-      customerList[i].formConfig = (typeof fcRaw === 'string') ? JSON.parse(fcRaw) : fcRaw;
+    if (!customerList[i].formConfig) {
+      const fcRaw = await getSetting('fc_' + (customerList[i].name||'').replace(/\W/g,'_'), null);
+      if (fcRaw) customerList[i].formConfig = (typeof fcRaw === 'string') ? JSON.parse(fcRaw) : fcRaw;
     }
   }
+
+  // Current customer set karo
   const lastCustName = await getSetting('lastCustomer', null);
   const resolvedName = lastCustName ? ((typeof lastCustName==='string'?JSON.parse(lastCustName):lastCustName).name) : null;
   currentCustomer = customerList.find(c => c.name === resolvedName) || customerList[0];
 
-  // 6. Load monthly rates
+  // Monthly rates
   await loadMonthlyRates();
 
-  // 7. Filter invoices for current customer
+  // Current customer ke invoices filter karo
   applyCustomerFilter();
+}
+
+// ── DEFAULT CUSTOMERS SETUP ──
+async function buildDefaultCustomers() {
+  const nadeemHiddenFields = ['rate','amount'];
+  const nadeemFormConfig = { fields: Object.fromEntries(
+    ['desc','customerName','qty','totalWt','tareWt','neatWt','wastePct','waste','neatAfter','rate','amount','person','notes'].map(k => [k, {
+      visible: !nadeemHiddenFields.includes(k),
+      defaultVal: k==='customerName'?'Nadeem':k==='person'?'Nadeem':''
+    }])
+  )};
+  const list = [
+    { name: 'Sarfaraz Abbasi', prefix: 'AAF' },
+    { name: 'Nadeem', prefix: 'AAFN', formConfig: nadeemFormConfig }
+  ];
+  await setSetting('customerList', list);
+  await setSetting('fc_Nadeem', nadeemFormConfig);
+  return list;
 }
 
 // ── MIGRATION from localStorage ──
