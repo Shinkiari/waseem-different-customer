@@ -4485,6 +4485,8 @@ async function viewSavedReport(idx) {
     </div>
     <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
       <button class="btn btn-gold btn-sm" onclick="exportSavedReportXLSX(${idx})">📊 Excel</button>
+      <button class="btn btn-red btn-sm" onclick="pdfSavedReport(${idx})">📄 PDF</button>
+      <button class="btn btn-green btn-sm" onclick="printSavedReport(${idx})">🖨️ Print</button>
       <button class="btn btn-gray btn-sm" onclick="closeModal('viewReportModal');showSavedReports()">← Back</button>
     </div>`;
 
@@ -4492,6 +4494,158 @@ async function viewSavedReport(idx) {
   document.getElementById('viewReportTitle').textContent = r.name;
   document.getElementById('viewReportBody').innerHTML = html;
   openModal('viewReportModal');
+}
+
+// ── PRINT SAVED REPORT ──
+async function printSavedReport(idx) {
+  const raw = await getSetting('savedReports', null);
+  const all = raw ? (Array.isArray(raw) ? raw : JSON.parse(raw)) : [];
+  const r = all[idx]; if (!r) return;
+
+  const show = r.show || {qty:true,totalWt:true,neatWt:true,waste:true,neatAfter:true,rate:true,amount:true,person:true};
+  const totalAmt = r.data.reduce((s,i)=>s+(parseFloat(i.amount)||0),0);
+  const totalWt  = r.data.reduce((s,i)=>s+(parseFloat(i.neatWt)||0),0);
+
+  const thCols =
+    '<th>Inv#</th><th>Date</th><th>Description</th>' +
+    (show.qty       ? '<th>Qty</th>'        : '') +
+    (show.totalWt   ? '<th>Total Wt</th>'   : '') +
+    (show.neatWt    ? '<th>Neat Wt</th>'    : '') +
+    (show.waste     ? '<th>Wastage</th>'    : '') +
+    (show.neatAfter ? '<th>Net After W</th>': '') +
+    (show.rate      ? '<th>Rate</th>'       : '') +
+    (show.amount    ? '<th>Amount</th>'     : '') +
+    (show.person    ? '<th>Person</th>'     : '');
+
+  const rows = r.data.map(i =>
+    `<tr>
+      <td><b>${i.invNo}</b></td><td>${i.date}</td><td>${i.desc}</td>
+      ${show.qty       ? `<td>${i.qty||'—'}</td>` : ''}
+      ${show.totalWt   ? `<td>${i.totalWt||0} KG</td>` : ''}
+      ${show.neatWt    ? `<td>${i.neatWt||0} KG</td>` : ''}
+      ${show.waste     ? `<td>${i.waste||0} KG</td>` : ''}
+      ${show.neatAfter ? `<td>${i.neatAfter||0} KG</td>` : ''}
+      ${show.rate      ? `<td>${parseFloat(i.rate||0)>0?'Rs '+parseFloat(i.rate).toLocaleString():''}</td>` : ''}
+      ${show.amount    ? `<td><b>${parseFloat(i.amount||0)>0?'Rs '+parseFloat(i.amount).toLocaleString():''}</b></td>` : ''}
+      ${show.person    ? `<td>${i.person}</td>` : ''}
+    </tr>`).join('');
+
+  const win = window.open('','_blank');
+  win.document.write(`<!DOCTYPE html><html><head>
+    <title>${r.name}</title>
+    <style>
+      body{font-family:Arial,sans-serif;padding:20px;color:#000;}
+      h2{color:#0a3d1c;margin:0 0 4px;font-size:1.2rem;}
+      .meta{font-size:.8rem;color:#555;margin-bottom:12px;}
+      .summary{display:flex;gap:20px;margin-bottom:14px;font-size:.88rem;}
+      .summary span{font-weight:700;}
+      table{width:100%;border-collapse:collapse;font-size:.78rem;}
+      th{background:#0a3d1c;color:#fff;padding:7px 9px;text-align:left;}
+      td{padding:6px 9px;border-bottom:1px solid #ddd;}
+      tr:nth-child(even) td{background:#f5faf6;}
+      tfoot td{font-weight:700;background:#f0fdf4;border-top:2px solid #0a3d1c;}
+      .footer{text-align:center;margin-top:20px;font-size:.7rem;color:#999;border-top:1px solid #ddd;padding-top:8px;}
+      @media print{@page{size:A4 landscape;margin:8mm 10mm;}}
+    </style>
+  </head><body>
+    <h2>🌿 Ahsin Agri Farm — ${r.name}</h2>
+    <div class="meta">👤 ${r.customer||'All'} &nbsp;|&nbsp; 📅 ${r.from||'All'} → ${r.to||'All'} &nbsp;|&nbsp; Records: <b>${r.totalRecords}</b></div>
+    <div class="summary">
+      <span>⚖️ Total Wt: ${totalWt.toFixed(1)} KG</span>
+      ${totalAmt ? `<span>💰 Total: Rs ${Math.round(totalAmt).toLocaleString()}</span>` : ''}
+    </div>
+    <table>
+      <thead><tr>${thCols}</tr></thead>
+      <tbody>${rows}</tbody>
+      <tfoot><tr>
+        <td colspan="3"><b>TOTAL</b></td>
+        ${show.qty?'<td></td>':''}
+        ${show.totalWt?'<td></td>':''}
+        ${show.neatWt?`<td><b>${totalWt.toFixed(1)} KG</b></td>`:''}
+        ${show.waste?'<td></td>':''}
+        ${show.neatAfter?'<td></td>':''}
+        ${show.rate?'<td></td>':''}
+        ${show.amount?`<td><b>Rs ${Math.round(totalAmt).toLocaleString()}</b></td>`:''}
+        ${show.person?'<td></td>':''}
+      </tr></tfoot>
+    </table>
+    <div class="footer">Ahsin Agri Farm — Power Technology by Shinkiari</div>
+    <script>window.onload=()=>window.print();<\/script>
+  </body></html>`);
+  win.document.close();
+}
+
+// ── PDF SAVED REPORT ──
+async function pdfSavedReport(idx) {
+  const raw = await getSetting('savedReports', null);
+  const all = raw ? (Array.isArray(raw) ? raw : JSON.parse(raw)) : [];
+  const r = all[idx]; if (!r) return;
+
+  if (typeof window.jspdf === 'undefined' && typeof jsPDF === 'undefined') {
+    toast('⚠️ PDF library load nahi hua, Print option use karein.', 'error');
+    return;
+  }
+
+  const { jsPDF } = window.jspdf || window;
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+
+  const show = r.show || {qty:true,totalWt:true,neatWt:true,waste:true,neatAfter:true,rate:true,amount:true,person:true};
+  const totalAmt = r.data.reduce((s,i)=>s+(parseFloat(i.amount)||0),0);
+  const totalWt  = r.data.reduce((s,i)=>s+(parseFloat(i.neatWt)||0),0);
+
+  // Header
+  doc.setFontSize(14); doc.setTextColor(10,61,28);
+  doc.text('Ahsin Agri Farm — ' + r.name, 14, 14);
+  doc.setFontSize(9); doc.setTextColor(80,80,80);
+  doc.text(`Customer: ${r.customer||'All'}   |   Date: ${r.from||'All'} to ${r.to||'All'}   |   Records: ${r.totalRecords}`, 14, 21);
+  doc.text(`Total Weight: ${totalWt.toFixed(1)} KG   |   Total Amount: Rs ${Math.round(totalAmt).toLocaleString()}`, 14, 27);
+
+  // Table columns
+  const head = [['Inv#','Date','Description',
+    ...(show.qty?['Qty']:[]),
+    ...(show.totalWt?['Total Wt']:[]),
+    ...(show.neatWt?['Neat Wt']:[]),
+    ...(show.waste?['Wastage']:[]),
+    ...(show.neatAfter?['Net After W']:[]),
+    ...(show.rate?['Rate']:[]),
+    ...(show.amount?['Amount']:[]),
+    ...(show.person?['Person']:[])
+  ]];
+
+  const body = r.data.map(i => [
+    i.invNo, i.date, i.desc,
+    ...(show.qty?[i.qty||'—']:[]),
+    ...(show.totalWt?[i.totalWt+' KG']:[]),
+    ...(show.neatWt?[i.neatWt+' KG']:[]),
+    ...(show.waste?[i.waste+' KG']:[]),
+    ...(show.neatAfter?[i.neatAfter+' KG']:[]),
+    ...(show.rate?[parseFloat(i.rate||0)>0?'Rs '+parseFloat(i.rate).toFixed(0):'']:[]),
+    ...(show.amount?[parseFloat(i.amount||0)>0?'Rs '+Math.round(parseFloat(i.amount)).toLocaleString():'']:[]),
+    ...(show.person?[i.person]:[])
+  ]);
+
+  doc.autoTable({
+    head, body,
+    startY: 32,
+    styles: { fontSize: 7.5, cellPadding: 2 },
+    headStyles: { fillColor: [10,61,28], textColor: 255, fontStyle:'bold' },
+    alternateRowStyles: { fillColor: [240,253,244] },
+    foot: [['TOTAL','','',
+      ...(show.qty?['']:[]),
+      ...(show.totalWt?['']:[]),
+      ...(show.neatWt?[totalWt.toFixed(1)+' KG']:[]),
+      ...(show.waste?['']:[]),
+      ...(show.neatAfter?['']:[]),
+      ...(show.rate?['']:[]),
+      ...(show.amount?['Rs '+Math.round(totalAmt).toLocaleString()]:[]),
+      ...(show.person?['']:[])
+    ]],
+    footStyles: { fillColor: [240,253,244], textColor:[10,61,28], fontStyle:'bold' }
+  });
+
+  const fname = (r.name||'report').replace(/[^a-zA-Z0-9_-]/g,'_') + '_' + new Date().toISOString().slice(0,10) + '.pdf';
+  doc.save(fname);
+  toast('✅ PDF download ho gaya!');
 }
 
 async function loadSavedReport(idx) {
