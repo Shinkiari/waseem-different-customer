@@ -4026,34 +4026,53 @@ function savePendingBillsLS() {
 function renderPending() {
   const tbody = document.getElementById('pbBody');
   if (!tbody) return;
-  if (!pendingBills.length) {
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--gray);padding:16px;">Koi pending bill nahi</td></tr>';
+
+  // ✅ Sirf active customer k bills dikhao
+  const custName = currentCustomer ? currentCustomer.name : '';
+  const filteredBills = pendingBills.filter(b => b.person === custName);
+
+  // Default person field mein current customer ka naam
+  const personEl = document.getElementById('pbPerson');
+  if (personEl && !personEl.value) personEl.value = custName;
+  if (personEl) personEl.placeholder = custName || 'e.g. Sarfaraz Abbasi';
+
+  if (!filteredBills.length) {
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--gray);padding:16px;">${custName} k liye koi pending bill nahi</td></tr>`;
     document.getElementById('pbTotal').textContent = 'Rs 0';
+    const grandEl = document.getElementById('pbGrandTotal');
+    if (grandEl) grandEl.textContent = 'Rs 0 (+ Report)';
     return;
   }
+
   const statusColor = { Pending: '#c0392b', Partial: '#e67e22', Cleared: '#27ae60' };
   const statusEmoji = { Pending: '🔴', Partial: '🟡', Cleared: '🟢' };
-  tbody.innerHTML = pendingBills.map((b, i) => `<tr>
-    <td>${i + 1}</td>
-    <td><b>${b.person}</b></td>
-    <td>${b.date || '—'}</td>
-    <td>${b.desc}</td>
-    <td>${b.contact || '—'}</td>
-    <td><b>Rs ${Number(b.amount || 0).toLocaleString()}</b></td>
-    <td><span style="color:${statusColor[b.status]};font-weight:700;">${statusEmoji[b.status]} ${b.status}</span></td>
-    <td>
-      <button class="btn btn-gray btn-sm" onclick="editPendingBill(${i})">✏️</button>
-      <button class="btn btn-red btn-sm" onclick="deletePendingBill(${i})">🗑️</button>
-    </td>
-  </tr>`).join('');
 
-  const pendingOnly = pendingBills.filter(b => b.status !== 'Cleared');
+  tbody.innerHTML = filteredBills.map((b) => {
+    const origIdx = pendingBills.indexOf(b);
+    return `<tr>
+      <td>${origIdx + 1}</td>
+      <td><b>${b.person}</b></td>
+      <td>${b.date || '—'}</td>
+      <td>${b.desc}</td>
+      <td>${b.contact || '—'}</td>
+      <td><b>Rs ${Number(b.amount || 0).toLocaleString()}</b></td>
+      <td><span style="color:${statusColor[b.status]};font-weight:700;">${statusEmoji[b.status]} ${b.status}</span></td>
+      <td>
+        <button class="btn btn-gray btn-sm" onclick="editPendingBill(${origIdx})">✏️</button>
+        <button class="btn btn-red btn-sm" onclick="deletePendingBill(${origIdx})">🗑️</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const pendingOnly = filteredBills.filter(b => b.status !== 'Cleared');
   const total = pendingOnly.reduce((s, b) => s + Number(b.amount || 0), 0);
   document.getElementById('pbTotal').textContent = 'Rs ' + total.toLocaleString();
-  // Grand total — report total + pending
+
   const reportTotal = currentReport.length ? currentReport.reduce((s,i)=>s+i.amount,0) : 0;
   const grandEl = document.getElementById('pbGrandTotal');
-  if (grandEl) grandEl.textContent = reportTotal ? 'Rs ' + (reportTotal + total).toLocaleString() : 'Rs ' + total.toLocaleString() + ' (+ Report)';
+  if (grandEl) grandEl.textContent = reportTotal
+    ? 'Rs ' + (reportTotal + total).toLocaleString()
+    : 'Rs ' + total.toLocaleString() + ' (+ Report)';
 }
 
 function savePendingBill() {
@@ -4112,9 +4131,14 @@ function cancelPbEdit() {
 }
 
 function getPendingBillsHTML(reportTotal) {
-  if (!pendingBills.length) return { html: '', pendingTotal: 0 };
+  // ✅ Sirf current customer k pending bills report mein dalo
+  const custName = currentCustomer ? currentCustomer.name : '';
+  const custBills = pendingBills.filter(b => b.person === custName);
+
+  if (!custBills.length) return { html: '', pendingTotal: 0 };
+
   const statusColor = { Pending: '#c0392b', Partial: '#e67e22', Cleared: '#27ae60' };
-  const rows = pendingBills.map(b => `<tr>
+  const rows = custBills.map(b => `<tr>
     <td><b>${b.person}</b></td>
     <td>${fmtDate(b.date)}</td>
     <td>${b.desc}</td>
@@ -4122,12 +4146,14 @@ function getPendingBillsHTML(reportTotal) {
     <td style="text-align:right;"><b>Rs ${Number(b.amount || 0).toLocaleString()}</b></td>
     <td style="color:${statusColor[b.status]};font-weight:700;">${b.status}</td>
   </tr>`).join('');
-  const pendingOnly = pendingBills.filter(b => b.status !== 'Cleared');
+
+  const pendingOnly = custBills.filter(b => b.status !== 'Cleared');
   const pendingTotal = pendingOnly.reduce((s, b) => s + Number(b.amount || 0), 0);
   const grandTotal = (reportTotal || 0) + pendingTotal;
+
   const html = `
   <div class="pending-section" style="page-break-inside:avoid;">
-    <div class="pending-title">⚠️ Pending Bills</div>
+    <div class="pending-title">⚠️ Pending Bills — ${custName}</div>
     <table class="pending-table">
       <thead><tr><th>Person</th><th>Date</th><th>Description</th><th>Contact</th><th style="text-align:right;">Amount</th><th>Status</th></tr></thead>
       <tbody>${rows}</tbody>
