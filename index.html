@@ -2117,7 +2117,8 @@ async function loadData() {
 
 // ── DEFAULT CUSTOMERS SETUP ──
 async function buildDefaultCustomers() {
-  const nadeemHiddenFields = ['rate','amount'];
+  // Nadeem k liye hidden fields: rate, amount, wastage, net after wastage
+  const nadeemHiddenFields = ['rate','amount','waste','neatAfter','wastePct'];
   const nadeemFormConfig = { fields: Object.fromEntries(
     ['desc','customerName','qty','totalWt','tareWt','neatWt','wastePct','waste','neatAfter','rate','amount','person','notes'].map(k => [k, {
       visible: !nadeemHiddenFields.includes(k),
@@ -5691,7 +5692,7 @@ async function settDeleteDescription(custName, descIdx) {
     await initDark();
     bar.style.width = '100%';
 
-    setTimeout(() => {
+    setTimeout(async () => {
       document.getElementById('appLoader').remove();
       // Hide app layout initially
       document.querySelector('.app-layout').style.display = 'none';
@@ -5700,6 +5701,24 @@ async function settDeleteDescription(custName, descIdx) {
       // ☁️ Firebase Realtime Sync shuru karo
       if (typeof window.aafStartRealtimeSync === 'function') {
         setTimeout(() => window.aafStartRealtimeSync(), 1000);
+      }
+
+      // ✅ ONE-TIME MIGRATION: Nadeem k formConfig mein waste+neatAfter hide karo
+      const migVer = await getSetting('nadeemFcMigV2', false);
+      if (!migVer) {
+        const nadeemHiddenFields = ['rate','amount','waste','neatAfter','wastePct'];
+        const nadeemFormConfig = { fields: Object.fromEntries(
+          ['desc','customerName','qty','totalWt','tareWt','neatWt','wastePct','waste','neatAfter','rate','amount','person','notes'].map(k => [k, {
+            visible: !nadeemHiddenFields.includes(k),
+            defaultVal: k==='customerName'?'Nadeem':k==='person'?'Nadeem':''
+          }])
+        )};
+        await setSetting('fc_Nadeem', nadeemFormConfig);
+        // customerList mein bhi update karo
+        const nIdx = customerList.findIndex(c => c.name === 'Nadeem');
+        if (nIdx !== -1) { customerList[nIdx].formConfig = nadeemFormConfig; }
+        await setSetting('customerList', customerList);
+        await setSetting('nadeemFcMigV2', true);
       }
     }, 300);
 
