@@ -3999,6 +3999,68 @@ async function generateReport() {
   document.getElementById('reportResult').style.display='block';
   populateMonthYearBtns();
   switchRptTab('detail'); // always reset to detail view on new generate
+
+  // ✅ Sarfaraz Abbasi k pending bills report k end mein dikhao
+  const custNameRpt = currentCustomer ? currentCustomer.name : '';
+  const custPendingBills = pendingBills.filter(b => b.person === custNameRpt);
+  let pendingSectionEl = document.getElementById('rpt-pending-section');
+  if (!pendingSectionEl) {
+    pendingSectionEl = document.createElement('div');
+    pendingSectionEl.id = 'rpt-pending-section';
+    pendingSectionEl.style.cssText = 'margin-top:20px;';
+    document.getElementById('reportResult').appendChild(pendingSectionEl);
+  }
+
+  if (custPendingBills.length > 0) {
+    const pendingOnly = custPendingBills.filter(b => b.status !== 'Cleared');
+    const pendingTotal = pendingOnly.reduce((s, b) => s + Number(b.amount || 0), 0);
+    const grandTotal = totalAmt + pendingTotal;
+    const statusColor = { Pending: '#c0392b', Partial: '#e67e22', Cleared: '#27ae60' };
+    const statusEmoji = { Pending: '🔴', Partial: '🟡', Cleared: '🟢' };
+    const pbRows = custPendingBills.map(b => `
+      <tr>
+        <td><b>${b.person}</b></td>
+        <td>${b.date||'—'}</td>
+        <td>${b.desc}</td>
+        <td>${b.contact||'—'}</td>
+        <td style="text-align:right;"><b>Rs ${Number(b.amount||0).toLocaleString()}</b></td>
+        <td><span style="color:${statusColor[b.status]};font-weight:700;">${statusEmoji[b.status]} ${b.status}</span></td>
+      </tr>`).join('');
+
+    pendingSectionEl.innerHTML = `
+      <div style="border:2px solid #e67e22;border-radius:12px;overflow:hidden;">
+        <div style="background:#fef3c7;padding:10px 16px;font-size:.85rem;font-weight:700;color:#92400e;border-bottom:1px solid #fcd34d;">
+          ⚠️ Pending Bills — ${custNameRpt}
+        </div>
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;font-size:.82rem;">
+            <thead><tr style="background:#fcd34d;">
+              <th style="padding:7px 10px;text-align:left;">Person</th>
+              <th style="padding:7px 10px;text-align:left;">Date</th>
+              <th style="padding:7px 10px;text-align:left;">Description</th>
+              <th style="padding:7px 10px;text-align:left;">Contact</th>
+              <th style="padding:7px 10px;text-align:right;">Amount</th>
+              <th style="padding:7px 10px;text-align:left;">Status</th>
+            </tr></thead>
+            <tbody>${pbRows}</tbody>
+            <tfoot>
+              <tr style="background:#fef9c3;">
+                <td colspan="4" style="padding:7px 10px;"><b>Total Pending (Cleared ke baghair)</b></td>
+                <td style="padding:7px 10px;text-align:right;"><b style="color:#c0392b;">Rs ${pendingTotal.toLocaleString()}</b></td>
+                <td></td>
+              </tr>
+              <tr style="background:#0a3d1c;">
+                <td colspan="4" style="padding:9px 10px;color:#fff;font-weight:700;">🧾 GRAND TOTAL (Report + Pending)</td>
+                <td style="padding:9px 10px;text-align:right;color:#fcd34d;font-weight:700;font-size:.95rem;">Rs ${grandTotal.toLocaleString()}</td>
+                <td></td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      </div>`;
+  } else {
+    pendingSectionEl.innerHTML = '';
+  }
 }
 
 function clearReport() {
@@ -4230,6 +4292,20 @@ async function printReport() {
   if (show.neatAfter) cardsHtml += `<div class="card green"><label>Net After Waste</label><div class="val">${totalKg.toFixed(1)} KG</div></div>`;
   if (show.waste)     cardsHtml += `<div class="card red"><label>Total Wastage</label><div class="val">${totalWaste.toFixed(1)} KG</div></div>`;
 
+  // ✅ Pending bills bhi include karo (sirf current customer k)
+  const { html: pendingHtml, pendingTotal } = getPendingBillsHTML(totalAmt);
+  const grandTotalAmt = totalAmt + pendingTotal;
+
+  const pendingStyles = pendingTotal > 0 ? `
+    .pending-section{margin-top:16px;border:2px solid #e67e22;border-radius:8px;overflow:hidden;page-break-inside:avoid;}
+    .pending-title{background:#fef3c7;padding:8px 12px;font-size:.75rem;font-weight:700;color:#92400e;border-bottom:1px solid #fcd34d;}
+    .pending-table{width:100%;border-collapse:collapse;font-size:.65rem;}
+    .pending-table thead tr{background:#fcd34d;}
+    .pending-table th{padding:5px 7px;text-align:left;}
+    .pending-table td{padding:4px 7px;border-bottom:1px solid #fde68a;}
+    .pending-table tfoot tr:last-child{background:#0a3d1c;color:#fff;}
+    .pending-table tfoot tr:last-child td{color:#fcd34d;font-weight:700;}` : '';
+
   const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Ahsin Agri Farm — Report</title>
   <style>
     @page{size:A4 landscape;margin:8mm 10mm;}
@@ -4256,6 +4332,7 @@ async function printReport() {
     tr.total-row td{font-weight:700;background:#e8f5eb;border-top:2px solid #1a5c2a;}
     tr.total-row td:last-child{text-align:right;}
     .footer{margin-top:10px;text-align:center;font-size:.58rem;color:#888;border-top:1px solid #cdd9cf;padding-top:6px;}
+    ${pendingStyles}
   </style></head><body>
   <div class="header"><h2>🌿 Ahsin Agri Farm</h2><div class="sub">Shoukat, Khanpur Shinkiari, KPK</div>
   <div class="sub">Period: ${from||'All'} to ${to||'All'}${person?' | Person: '+person:''}</div></div>
@@ -4264,6 +4341,7 @@ async function printReport() {
   <tbody>${rows}
   <tr class="total-row">${totalRow}</tr>
   </tbody></table>
+  ${pendingHtml}
   <div class="footer">Ahsin Agri Farm — Printed on ${new Date().toLocaleDateString('en-PK')}</div>
   </body></html>`;
   const w=window.open('','_blank','width=900,height=700');
