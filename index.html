@@ -5453,7 +5453,7 @@ function addCfsDescription() {
   const name     = document.getElementById('cfsNewDescName').value.trim();
   const tareWt   = parseFloat(document.getElementById('cfsNewDescTare').value) || 1.5;
   const rate     = parseFloat(document.getElementById('cfsNewDescRate').value) || 90;
-  const wastePct = parseFloat(document.getElementById('cfsNewDescWaste').value) || 15;
+  const wastePct = document.getElementById('cfsNewDescWaste').value.trim() !== '' ? (parseFloat(document.getElementById('cfsNewDescWaste').value) ?? 15) : 15;
 
   if (!name) { toast('⚠️ Description name likhen!', 'error'); return; }
 
@@ -5626,7 +5626,7 @@ async function settAddDescription() {
   const name     = document.getElementById('settNewDescName').value.trim();
   const tareWt   = parseFloat(document.getElementById('settNewDescTare').value) || 1.5;
   const rate     = parseFloat(document.getElementById('settNewDescRate').value) || 90;
-  const wastePct = parseFloat(document.getElementById('settNewDescWaste').value) || 15;
+  const wastePct = document.getElementById('settNewDescWaste').value.trim() !== '' ? (parseFloat(document.getElementById('settNewDescWaste').value) ?? 15) : 15;
 
   if (!name) { alertEl.className='alert error'; alertEl.textContent='⚠️ Description name likhen!'; return; }
   const BASE = ['Ice Burg Basket', 'Ice Burg Box/Carton'];
