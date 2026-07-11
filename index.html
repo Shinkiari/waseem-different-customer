@@ -137,11 +137,15 @@ function aafStartRealtimeSync() {
       return;
     }
 
-    // ☁️ Cloud data milega — local se compare karo
+    // ☁️ Cloud data milega — MERGE karo (kabhi blind overwrite nahi)
     const localCount = (typeof allInvoices !== 'undefined') ? allInvoices.length : 0;
     if (cloud.invoices.length !== localCount ||
         JSON.stringify(cloud.invoices) !== JSON.stringify(allInvoices)) {
-      allInvoices = cloud.invoices;
+      const merged = (typeof aafMergeById === 'function')
+        ? aafMergeById(allInvoices || [], cloud.invoices)
+        : cloud.invoices; // fallback agar merge fn mojood na ho
+      const grew = merged.length !== cloud.invoices.length;
+      allInvoices = merged;
       // IndexedDB update
       if (typeof dbClear === 'function') {
         await dbClear('invoices');
@@ -150,6 +154,8 @@ function aafStartRealtimeSync() {
       // Customer filter refresh
       if (typeof applyCustomerFilter === 'function') applyCustomerFilter();
       if (typeof renderAll === 'function') renderAll();
+      // Agar merge se naya (bara) data bana ho, cloud ko bhi turant update kar do
+      if (grew) aafFbPushAll().catch(() => {});
     }
     if (cloud.trash && Array.isArray(cloud.trash)) {
       trashItems = cloud.trash;
@@ -2066,47 +2072,70 @@ async function saveTrash() {
 
 async function loadData() {
   // ════════════════════════════════════════════
-  // ☁️ CLOUD FIRST — LocalStorage/IndexedDB se
-  //    data KABHI nahi lena — sirf Firebase cloud
+  // ✅ MERGE-SAFE LOAD — local IndexedDB hamesha
+  //    fallback/base hai; cloud sirf ADD karta hai,
+  //    kabhi kisi invoice ko GHAYAB nahi karta.
   // ════════════════════════════════════════════
 
-  // Firebase module load hone ka thoda wait karo
+  // 1) Local data pehle load karo — ye hamesha available hai (offline bhi)
+  let localInvoices = [];
+  let localTrash     = [];
+  try {
+    localInvoices = await dbGetAll('invoices');
+    localTrash    = await dbGetAll('trash');
+  } catch(e) { /* local bhi na mile to khali arrays rahengi */ }
+
+  // 2) Firebase module load hone ka thoda wait karo (max 2s), lekin
+  //    fail hone par app ko rokna nahi — local data se hi chalu ho jaye
   let tries = 0;
   while (typeof window.aafLoadFromCloud !== 'function' && tries < 20) {
     await new Promise(r => setTimeout(r, 100));
     tries++;
   }
 
-  if (typeof window.aafLoadFromCloud !== 'function') {
-    throw new Error('☁️ Firebase load nahi hua. Page refresh karein.');
-  }
-
-  // Cloud se data fetch karo
   let cloudData = null;
-  try {
-    cloudData = await window.aafLoadFromCloud();
-  } catch(e) {
-    throw new Error('🔴 Internet nahi hai ya Firebase error: ' + e.message + '\n\nInternet connect karein aur page refresh karein.');
-  }
-
-  if (cloudData && cloudData.invoices && Array.isArray(cloudData.invoices)) {
-    // ✅ Cloud mein data hai — use karo
-    allInvoices = cloudData.invoices;
-    trashItems  = (cloudData.trash && Array.isArray(cloudData.trash)) ? cloudData.trash : [];
-
-    // Customer list cloud se
-    if (cloudData.customerList && Array.isArray(cloudData.customerList)) {
-      customerList = cloudData.customerList;
-    } else {
-      customerList = await buildDefaultCustomers();
+  let cloudOk = false;
+  if (typeof window.aafLoadFromCloud === 'function') {
+    try {
+      cloudData = await window.aafLoadFromCloud();
+      cloudOk = true;
+    } catch(e) {
+      console.warn('☁️ Cloud fetch fail — local data se chalu ho raha hai:', e.message);
     }
-
   } else {
-    // ☁️ Cloud khali hy — pehli baar use, fresh start
-    allInvoices  = [];
-    trashItems   = [];
-    customerList = await buildDefaultCustomers();
+    console.warn('☁️ Firebase module load nahi hua — local data se chalu ho raha hai.');
   }
+
+  const cloudInvoices = (cloudOk && cloudData && Array.isArray(cloudData.invoices)) ? cloudData.invoices : [];
+  const cloudTrash     = (cloudOk && cloudData && Array.isArray(cloudData.trash))    ? cloudData.trash    : [];
+
+  // 3) MERGE — id se union, koi bhi invoice/trash entry kabhi drop nahi hoti
+  allInvoices = aafMergeById(localInvoices, cloudInvoices);
+  trashItems  = aafMergeById(localTrash, cloudTrash);
+
+  // Customer list: cloud > local setting > default
+  if (cloudOk && cloudData && cloudData.customerList && Array.isArray(cloudData.customerList) && cloudData.customerList.length) {
+    customerList = cloudData.customerList;
+  } else {
+    const savedList = await getSetting('customerList', null);
+    customerList = savedList ? (typeof savedList === 'string' ? JSON.parse(savedList) : savedList) : await buildDefaultCustomers();
+  }
+
+  // 4) Agar merge ke baad naya combined data cloud se bara/mukhtalif hai,
+  //    to cloud ko turant is merged (poori) copy se update kar do —
+  //    taake koi bhi device ab is se pehle wali "missing invoices" na dekhe
+  const mergedIsBigger = allInvoices.length !== cloudInvoices.length || trashItems.length !== cloudTrash.length;
+  if (cloudOk && mergedIsBigger && typeof window.aafFbPushAll === 'function') {
+    window.aafFbPushAll().catch(() => {});
+  }
+
+  // 5) Local IndexedDB ko bhi turant merged (poora) data se sync kar do
+  try {
+    await dbClear('invoices');
+    if (allInvoices.length) await dbBulkPut('invoices', allInvoices);
+    await dbClear('trash');
+    if (trashItems.length) await dbBulkPut('trash', trashItems);
+  } catch(e) { /* best effort */ }
 
   // Purana trash expire karo (30 din se zyada)
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
@@ -2130,6 +2159,22 @@ async function loadData() {
 
   // Current customer ke invoices filter karo
   applyCustomerFilter();
+
+  if (!cloudOk && typeof window.aafSyncBadge === 'function') {
+    window.aafSyncBadge('📴 Offline — local data se chalu', '#ef4444');
+  }
+}
+
+// ── SAFE MERGE BY ID — kabhi kisi record ko GHAYAB nahi karta ──
+// Dono arrays ko id se combine karta hai. Agar same id dono jagah hai
+// to local (a) wali copy rakhi jati hai (zyada fresh maani jati hai),
+// lekin jo bhi sirf ek taraf hai (chahe local ho ya cloud), wo hamesha
+// rehti hai — is liye koi invoice kabhi "gum" nahi hoti.
+function aafMergeById(a, b) {
+  const map = new Map();
+  (b || []).forEach(item => { if (item && item.id != null) map.set(item.id, item); });
+  (a || []).forEach(item => { if (item && item.id != null) map.set(item.id, item); }); // a (local) overrides on conflict
+  return [...map.values()];
 }
 
 // ── DEFAULT CUSTOMERS SETUP ──
