@@ -88,7 +88,31 @@ function aafFbPush() {
       aafSyncBadge('⚠️ Save fail!', '#ef4444');
       setTimeout(aafFbPush, 5000);
     }
-  }, 600);
+  }, 250); // ⬅ 600ms se 250ms kiya — cloud tak jaldi pohanchay
+}
+
+// ── IMMEDIATE FLUSH (tab band/minimize hone par turant bhejta hai) ──
+// ✅ PUT method use karta hai (POST/sendBeacon ki tarah nahi) taake
+//    Firebase par pura node sahi tarah OVERWRITE ho, alag stray record na bane.
+//    keepalive:true browser ko request poori karne deta hai chahay tab band ho jaye.
+function aafFbFlush() {
+  clearTimeout(_aafTimer);
+  if (typeof allInvoices === 'undefined' || !allInvoices.length) return;
+  const payload = {
+    invoices:     allInvoices,
+    trash:        (typeof trashItems   !== 'undefined') ? trashItems   : [],
+    customerList: (typeof customerList !== 'undefined') ? customerList : [],
+    lastUpdated:  new Date().toISOString(),
+    lastDevice:   navigator.userAgent.substring(0, 60)
+  };
+  try {
+    fetch('https://waseem-sarfaraz-plus-default-rtdb.firebaseio.com/aaf_v5_data.json', {
+      method: 'PUT',
+      keepalive: true,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch(e) { /* best effort — kuch aur nahi ho sakta is stage par */ }
 }
 
 // ── REALTIME LISTENER ──
@@ -177,20 +201,12 @@ function aafHideBadge() {
 // ── AUTO INIT ──
 document.addEventListener('DOMContentLoaded', () => {
   aafInitFb();
-  // Tab band hone par bhi sync
+  // Tab minimize/switch/band hone par turant reliable flush (PUT+keepalive)
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden' && typeof allInvoices !== 'undefined' && allInvoices.length > 0) {
-      aafFbPushAll().catch(() => {});
-    }
+    if (document.visibilityState === 'hidden') aafFbFlush();
   });
-  window.addEventListener('beforeunload', () => {
-    if (typeof allInvoices !== 'undefined' && allInvoices.length > 0) {
-      navigator.sendBeacon(
-        'https://waseem-sarfaraz-plus-default-rtdb.firebaseio.com/aaf_v5_data.json',
-        new Blob([JSON.stringify({ invoices: allInvoices, trash: trashItems || [] })], { type: 'application/json' })
-      );
-    }
-  });
+  window.addEventListener('pagehide', aafFbFlush);
+  window.addEventListener('beforeunload', aafFbFlush);
 });
 
 // ── ONE-TIME CLOUD FETCH (startup ke liye) ──
@@ -207,6 +223,7 @@ async function aafLoadFromCloud() {
 // ── GLOBAL EXPORTS ──
 window.aafFbPush            = aafFbPush;
 window.aafFbPushAll         = aafFbPushAll;
+window.aafFbFlush           = aafFbFlush;
 window.aafStartRealtimeSync = aafStartRealtimeSync;
 window.aafForceUpload       = aafForceUpload;
 window.aafSyncBadge         = aafSyncBadge;
